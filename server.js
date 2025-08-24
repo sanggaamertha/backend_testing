@@ -1,4 +1,4 @@
-// server.js (Versi Final dengan Integrasi Midtrans dan Logika Anti Double-Booking)
+// server.js (Versi Final dengan Lanjutan Pembayaran & Batas Waktu)
 
 const express = require('express');
 const { MongoClient, ObjectId } = require('mongodb');
@@ -6,12 +6,8 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const validator = require('validator');
-const crypto = require('crypto');
-
-// --- [BARU] Import library Midtrans ---
 const midtransClient = require('midtrans-client');
 
-// --- [PENTING] Gunakan environment variables untuk kunci rausah ---
 require('dotenv').config();
 
 const app = express();
@@ -21,8 +17,6 @@ const port = 3000;
 const mongoUri = process.env.MONGO_URI;
 const dbName = "databaseBooking";
 const JWT_SECRET = process.env.JWT_SECRET;
-
-// --- [BARU] Konfigurasi Midtrans ---
 const MIDTRANS_SERVER_KEY = process.env.MIDTRANS_SERVER_KEY;
 const MIDTRANS_CLIENT_KEY = process.env.MIDTRANS_CLIENT_KEY;
 
@@ -124,43 +118,6 @@ async function calculatePrice(playtime) {
     }
     return price;
 }
-
-
-// === SHORTCUT UNTUK MEMBUAT ADMIN (HANYA UNTUK SETUP AWAL) ===
-app.get('/api/setup/create-initial-admin', async (req, res) => {
-    try {
-        const adminEmail = "admin@binton.com";
-        const existingAdmin = await db.collection('users').findOne({ email: adminEmail });
-        if (existingAdmin) {
-            return res.status(400).send('<h1>Akun admin sudah ada. Tidak perlu dibuat lagi.</h1><p>Silakan login dengan email: <strong>admin@binton.com</strong> dan password: <strong>passwordadmin123</strong></p>');
-        }
-
-        const adminData = {
-            name: "Admin Binton",
-            email: adminEmail,
-            password: await bcrypt.hash("passwordadmin123", 12),
-            phone: "08001234567",
-            isAdmin: true,
-            createdAt: new Date()
-        };
-        await db.collection('users').insertOne(adminData);
-        
-        console.log('✅ Akun admin berhasil dibuat!');
-        res.status(201).send(`
-            <h1>✅ Akun Admin Berhasil Dibuat!</h1>
-            <p>Silakan login di aplikasi admin dengan detail berikut:</p>
-            <ul>
-                <li>Email: <strong>${adminEmail}</strong></li>
-                <li>Password: <strong>passwordadmin123</strong></li>
-            </ul>
-            <p style="color:red;"><strong>PENTING:</strong> Setelah ini, hapus atau beri komentar pada endpoint ini di file server.js Anda demi keamanan.</p>
-        `);
-    } catch (error) {
-        console.error("Gagal membuat admin:", error);
-        res.status(500).send('<h1>Gagal membuat akun admin. Cek terminal backend.</h1>');
-    }
-});
-
 
 // === ENDPOINTS UNTUK APLIKASI KLIEN ===
 
@@ -265,6 +222,7 @@ app.get('/api/schedule', authUserMiddleware, async (req, res) => {
     }
 });
 
+
 app.post('/api/orders', authUserMiddleware, async (req, res) => {
     const { playtimes } = req.body;
     const userId = new ObjectId(req.user.userId);
@@ -303,7 +261,8 @@ app.post('/api/orders', authUserMiddleware, async (req, res) => {
             playtimes: validatedPlaytimes,
             total: serverTotal,
             orderStatus: 'pending',
-            createdAt: new Date()
+            createdAt: new Date(),
+            transactionToken: null 
         };
         await db.collection('orders').insertOne(newOrder);
 
@@ -312,20 +271,24 @@ app.post('/api/orders', authUserMiddleware, async (req, res) => {
                 order_id: orderId,
                 gross_amount: serverTotal
             },
-            customer_details: {
-                email: userEmail,
-            },
+            customer_details: { email: userEmail },
             item_details: item_details,
-            callbacks: {
-                finish: "https://your-frontend-app.com/payment-success"
+            expiry: {
+                unit: "hour",
+                duration: 1
             }
         };
 
         const transaction = await snap.createTransaction(parameter);
         const transactionToken = transaction.token;
 
+        await db.collection('orders').updateOne(
+            { _id: orderId },
+            { $set: { transactionToken: transactionToken } }
+        );
+
         res.status(201).json({ 
-            message: "Transaksi berhasil dibuat. Silakan selesaikan pembayaran.",
+            message: "Transaksi berhasil dibuat. Selesaikan pembayaran dalam 1 jam.",
             transactionToken,
             orderId: orderId
         });
@@ -336,26 +299,54 @@ app.post('/api/orders', authUserMiddleware, async (req, res) => {
     }
 });
 
+app.get('/api/orders/:orderId/resume-payment', authUserMiddleware, async (req, res) => {
+    try {
+        const { orderId } = req.params;
+        const userId = new ObjectId(req.user.userId);
+
+        const order = await db.collection('orders').findOne({ _id: orderId });
+
+        if (!order) {
+            return res.status(404).json({ message: "Pesanan tidak ditemukan." });
+        }
+        
+        if (!order.userId.equals(userId)) {
+            return res.status(403).json({ message: "Akses ditolak." });
+        }
+        
+        if (order.orderStatus !== 'pending') {
+            return res.status(400).json({ message: `Pesanan ini sudah ${order.orderStatus}.` });
+        }
+
+        const now = new Date();
+        const orderTime = new Date(order.createdAt);
+        const diffInMinutes = (now - orderTime) / (1000 * 60);
+
+        if (diffInMinutes > 60) {
+            await db.collection('orders').updateOne({ _id: orderId }, { $set: { orderStatus: 'failed' }});
+            return res.status(410).json({ message: "Waktu pembayaran sudah habis." });
+        }
+        
+        res.status(200).json({ transactionToken: order.transactionToken });
+
+    } catch (error) {
+        console.error("Resume Payment Error:", error);
+        res.status(500).json({ message: "Gagal melanjutkan pembayaran." });
+    }
+});
+
+
 app.post('/api/payment-notification', async (req, res) => {
     const notificationJson = req.body;
-
     try {
         const statusResponse = await snap.transaction.notification(notificationJson);
         const orderId = statusResponse.order_id;
         const transactionStatus = statusResponse.transaction_status;
         const fraudStatus = statusResponse.fraud_status;
 
-        console.log(`🔔 Notifikasi diterima untuk Order ID: ${orderId} | Status: ${transactionStatus} | Fraud: ${fraudStatus}`);
-
         const order = await db.collection('orders').findOne({ _id: orderId });
-        if (!order) {
-            console.error(`❌ Order ${orderId} tidak ditemukan.`);
-            return res.status(404).send("Order not found.");
-        }
-        
-        if (order.orderStatus === 'paid' || order.orderStatus === 'failed') {
-            console.log(`⏩ Order ${orderId} sudah pernah diproses. Status saat ini: ${order.orderStatus}. Notifikasi diabaikan.`);
-            return res.status(200).send("Notification already processed.");
+        if (!order || order.orderStatus === 'paid' || order.orderStatus === 'failed') {
+            return res.status(200).send("Notification already processed or order not found.");
         }
 
         let newStatus = order.orderStatus;
@@ -367,105 +358,48 @@ app.post('/api/payment-notification', async (req, res) => {
                 const existingPaidOrder = await db.collection('orders').findOne({
                     _id: { $ne: orderId },
                     'orderStatus': 'paid',
-                    'playtimes': {
-                        $elemMatch: {
-                            'courtName': pt.courtName,
-                            'date': new Date(pt.date),
-                            'startHour': pt.startHour
-                        }
-                    }
+                    'playtimes': { $elemMatch: { 'courtName': pt.courtName, 'date': new Date(pt.date), 'startHour': pt.startHour } }
                 });
-
                 if (existingPaidOrder) {
                     isSlotAvailable = false;
-                    console.warn(`⚔️ KONFLIK! Slot ${pt.courtName} @ ${pt.startHour} untuk order ${orderId} sudah di-booking oleh order ${existingPaidOrder._id}.`);
                     break;
                 }
             }
-
-            if (isSlotAvailable) {
-                newStatus = 'paid';
-                console.log(`✅ Kemenangan! Semua slot untuk order ${orderId} tersedia. Status diubah menjadi 'paid'.`);
-            } else {
-                newStatus = 'failed';
-                console.error(`❌ Kalah Balapan! Order ${orderId} gagal karena slot sudah dipesan. Status diubah menjadi 'failed'.`);
-            }
-
-        } else if (transactionStatus == 'cancel' || transactionStatus == 'deny' || transactionStatus == 'expire') {
+            newStatus = isSlotAvailable ? 'paid' : 'failed';
+        } else if (['cancel', 'deny', 'expire'].includes(transactionStatus)) {
             newStatus = 'failed';
-        } else if (transactionStatus == 'pending') {
-            newStatus = 'pending';
         }
 
         if (newStatus !== order.orderStatus) {
-            await db.collection('orders').updateOne(
-                { _id: orderId },
-                { $set: { orderStatus: newStatus, paymentResponse: statusResponse } }
-            );
-            console.log(`💾 Status order ${orderId} berhasil diupdate dari '${order.orderStatus}' menjadi '${newStatus}'.`);
+            await db.collection('orders').updateOne({ _id: orderId }, { $set: { orderStatus: newStatus, paymentResponse: statusResponse } });
         }
-
         res.status(200).send("Notification received successfully.");
-
     } catch (error) {
-        console.error("❌ Gagal memproses notifikasi Midtrans:", error.message);
         res.status(500).send("Internal Server Error");
     }
 });
 
-// =========================================================================
-// ======================== [ENDPOINT BARU DITAMBAHKAN] ====================
-// =========================================================================
-
-// Endpoint untuk mengambil semua pesanan milik user yang sedang login
 app.get('/api/my-orders', authUserMiddleware, async (req, res) => {
     try {
         const userId = new ObjectId(req.user.userId);
-        // Mengambil pesanan dan mengurutkannya dari yang paling baru
-        const orders = await db.collection('orders')
-            .find({ userId: userId })
-            .sort({ createdAt: -1 }) // -1 untuk descending (terbaru dulu)
-            .toArray();
+        const orders = await db.collection('orders').find({ userId: userId }).sort({ createdAt: -1 }).toArray();
         res.status(200).json(orders);
     } catch (error) {
-        console.error("Error fetching user orders:", error);
         res.status(500).json({ message: "Gagal mengambil data pesanan." });
     }
 });
 
-// Endpoint untuk mengupdate profil user
 app.put('/api/profile', authUserMiddleware, async (req, res) => {
     try {
         const userId = new ObjectId(req.user.userId);
         const { name, phone } = req.body;
-
-        if (!name || !phone) {
-            return res.status(400).json({ message: "Nama dan nomor telepon tidak boleh kosong." });
-        }
-
-        const result = await db.collection('users').updateOne(
-            { _id: userId },
-            { $set: { name: name, phone: phone } }
-        );
-
-        if (result.matchedCount === 0) {
-            return res.status(404).json({ message: "User tidak ditemukan." });
-        }
-
-        // Ambil data user yang sudah terupdate untuk dikirim kembali
-        const updatedUser = await db.collection('users').findOne(
-            { _id: userId },
-            { projection: { password: 0 } } // Jangan kirim password
-        );
-        
-        // Ganti _id menjadi id
+        if (!name || !phone) return res.status(400).json({ message: "Nama dan nomor telepon tidak boleh kosong." });
+        await db.collection('users').updateOne({ _id: userId }, { $set: { name: name, phone: phone } });
+        const updatedUser = await db.collection('users').findOne({ _id: userId }, { projection: { password: 0 } });
         updatedUser.id = updatedUser._id;
         delete updatedUser._id;
-
         res.status(200).json({ message: "Profil berhasil diperbarui.", user: updatedUser });
-
     } catch (error) {
-        console.error("Error updating profile:", error);
         res.status(500).json({ message: "Gagal memperbarui profil." });
     }
 });
@@ -534,3 +468,4 @@ app.put('/api/admin/memberships/:id', authAdminMiddleware, async (req, res) => {
         res.json({ message: 'Jadwal member berhasil dipindahkan.' });
     } catch (error) { res.status(500).json({ message: 'Gagal memindahkan jadwal member.' }); }
 });
+
