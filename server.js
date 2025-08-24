@@ -11,7 +11,7 @@ const crypto = require('crypto');
 // --- [BARU] Import library Midtrans ---
 const midtransClient = require('midtrans-client');
 
-// --- [PENTING] Gunakan environment variables untuk kunci rahasia ---
+// --- [PENTING] Gunakan environment variables untuk kunci rausah ---
 require('dotenv').config();
 
 const app = express();
@@ -188,9 +188,6 @@ app.post('/api/auth/login', async (req, res) => {
     } catch (error) { res.status(500).json({ message: 'Error server.' }); }
 });
 
-// =========================================================================
-// ======================== [PERUBAHAN PERTAMA] ============================
-// =========================================================================
 app.get('/api/schedule', authUserMiddleware, async (req, res) => {
     const { date } = req.query;
     if (!date) return res.status(400).json({ message: "Parameter 'date' dibutuhkan" });
@@ -213,10 +210,9 @@ app.get('/api/schedule', authUserMiddleware, async (req, res) => {
             return res.status(200).json({ message: `Tutup: ${event.reason}`, courts: [] });
         }
 
-        // --- [FIXED] Hanya mencari order yang statusnya 'paid' ---
         const regularBookings = await db.collection('orders').find({ 
             'playtimes.date': targetDate,
-            'orderStatus': 'paid' // <-- HANYA CEK STATUS 'paid'
+            'orderStatus': 'paid'
         }).toArray();
         
         const memberBookings = await db.collection('memberships').find({ recurringDay: dayOfWeek }).toArray();
@@ -340,15 +336,10 @@ app.post('/api/orders', authUserMiddleware, async (req, res) => {
     }
 });
 
-
-// =========================================================================
-// ======================== [PERUBAHAN KEDUA] ==============================
-// =========================================================================
 app.post('/api/payment-notification', async (req, res) => {
     const notificationJson = req.body;
 
     try {
-        // 1. Verifikasi notifikasi dari Midtrans
         const statusResponse = await snap.transaction.notification(notificationJson);
         const orderId = statusResponse.order_id;
         const transactionStatus = statusResponse.transaction_status;
@@ -356,34 +347,28 @@ app.post('/api/payment-notification', async (req, res) => {
 
         console.log(`🔔 Notifikasi diterima untuk Order ID: ${orderId} | Status: ${transactionStatus} | Fraud: ${fraudStatus}`);
 
-        // 2. Cari order di database kita
         const order = await db.collection('orders').findOne({ _id: orderId });
         if (!order) {
             console.error(`❌ Order ${orderId} tidak ditemukan.`);
             return res.status(404).send("Order not found.");
         }
         
-        // 3. Jika order sudah diproses (misal: sudah 'paid' atau 'failed'), jangan proses lagi
         if (order.orderStatus === 'paid' || order.orderStatus === 'failed') {
             console.log(`⏩ Order ${orderId} sudah pernah diproses. Status saat ini: ${order.orderStatus}. Notifikasi diabaikan.`);
             return res.status(200).send("Notification already processed.");
         }
 
-        // 4. Logika utama "First to Pay Wins"
-        let newStatus = order.orderStatus; // Default status tidak berubah
-
-        // Cek apakah transaksi SUKSES
+        let newStatus = order.orderStatus;
         const isSuccess = (transactionStatus == 'capture' && fraudStatus == 'accept') || transactionStatus == 'settlement';
 
         if (isSuccess) {
-            // Transaksi berhasil, SEKARANG kita cek ketersediaan slot
             let isSlotAvailable = true;
             for (const pt of order.playtimes) {
                 const existingPaidOrder = await db.collection('orders').findOne({
-                    _id: { $ne: orderId }, // Cari di order lain
-                    'orderStatus': 'paid',  // Yang statusnya sudah lunas
+                    _id: { $ne: orderId },
+                    'orderStatus': 'paid',
                     'playtimes': {
-                        $elemMatch: { // Cek apakah ada playtime yang cocok
+                        $elemMatch: {
                             'courtName': pt.courtName,
                             'date': new Date(pt.date),
                             'startHour': pt.startHour
@@ -392,33 +377,26 @@ app.post('/api/payment-notification', async (req, res) => {
                 });
 
                 if (existingPaidOrder) {
-                    // Ternyata slot sudah diambil orang lain!
                     isSlotAvailable = false;
                     console.warn(`⚔️ KONFLIK! Slot ${pt.courtName} @ ${pt.startHour} untuk order ${orderId} sudah di-booking oleh order ${existingPaidOrder._id}.`);
-                    break; // Hentikan pengecekan
+                    break;
                 }
             }
 
             if (isSlotAvailable) {
-                // AMAN! Pengguna ini yang pertama membayar.
                 newStatus = 'paid';
                 console.log(`✅ Kemenangan! Semua slot untuk order ${orderId} tersedia. Status diubah menjadi 'paid'.`);
             } else {
-                // KALAH! Slot sudah diambil.
-                newStatus = 'failed'; // Tandai sebagai gagal
+                newStatus = 'failed';
                 console.error(`❌ Kalah Balapan! Order ${orderId} gagal karena slot sudah dipesan. Status diubah menjadi 'failed'.`);
-                // Di dunia nyata, Anda akan memicu proses refund di sini.
             }
 
         } else if (transactionStatus == 'cancel' || transactionStatus == 'deny' || transactionStatus == 'expire') {
-            // Transaksi GAGAL dari sisi Midtrans
             newStatus = 'failed';
         } else if (transactionStatus == 'pending') {
-            // Transaksi masih PENDING
             newStatus = 'pending';
         }
 
-        // 5. Update status order di database JIKA ada perubahan
         if (newStatus !== order.orderStatus) {
             await db.collection('orders').updateOne(
                 { _id: orderId },
@@ -435,6 +413,62 @@ app.post('/api/payment-notification', async (req, res) => {
     }
 });
 
+// =========================================================================
+// ======================== [ENDPOINT BARU DITAMBAHKAN] ====================
+// =========================================================================
+
+// Endpoint untuk mengambil semua pesanan milik user yang sedang login
+app.get('/api/my-orders', authUserMiddleware, async (req, res) => {
+    try {
+        const userId = new ObjectId(req.user.userId);
+        // Mengambil pesanan dan mengurutkannya dari yang paling baru
+        const orders = await db.collection('orders')
+            .find({ userId: userId })
+            .sort({ createdAt: -1 }) // -1 untuk descending (terbaru dulu)
+            .toArray();
+        res.status(200).json(orders);
+    } catch (error) {
+        console.error("Error fetching user orders:", error);
+        res.status(500).json({ message: "Gagal mengambil data pesanan." });
+    }
+});
+
+// Endpoint untuk mengupdate profil user
+app.put('/api/profile', authUserMiddleware, async (req, res) => {
+    try {
+        const userId = new ObjectId(req.user.userId);
+        const { name, phone } = req.body;
+
+        if (!name || !phone) {
+            return res.status(400).json({ message: "Nama dan nomor telepon tidak boleh kosong." });
+        }
+
+        const result = await db.collection('users').updateOne(
+            { _id: userId },
+            { $set: { name: name, phone: phone } }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ message: "User tidak ditemukan." });
+        }
+
+        // Ambil data user yang sudah terupdate untuk dikirim kembali
+        const updatedUser = await db.collection('users').findOne(
+            { _id: userId },
+            { projection: { password: 0 } } // Jangan kirim password
+        );
+        
+        // Ganti _id menjadi id
+        updatedUser.id = updatedUser._id;
+        delete updatedUser._id;
+
+        res.status(200).json({ message: "Profil berhasil diperbarui.", user: updatedUser });
+
+    } catch (error) {
+        console.error("Error updating profile:", error);
+        res.status(500).json({ message: "Gagal memperbarui profil." });
+    }
+});
 
 
 // === ENDPOINTS UNTUK APLIKASI ADMIN ===
