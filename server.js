@@ -1,4 +1,4 @@
-// server.js (Versi Final - Real-time dengan Socket.IO)
+// server.js (Versi Final - Real-time dengan ID Slot Spesifik)
 
 const express = require("express");
 const http = require('http');
@@ -23,7 +23,7 @@ const io = new Server(server, {
   }
 });
 
-const port = 3000;
+const port = process.env.PORT || 3000;
 
 // --- KONFIGURASI ---
 const mongoUri = process.env.MONGO_URI;
@@ -284,10 +284,18 @@ app.post("/api/orders", authUserMiddleware, async (req, res) => {
     const transactionToken = transaction.token;
     await db.collection('orders').updateOne({ _id: orderId }, { $set: { transactionToken: transactionToken } });
 
+    // --- [PERUBAHAN] Kirim ID slot yang spesifik ---
     const bookingDate = format(new Date(playtimes[0].date), 'yyyy-MM-dd');
+    const updatedSlots = playtimes.map(pt => {
+        return `${pt.courtName}-${bookingDate}-${pt.startHour}`;
+    });
+
     const socketIo = req.app.get('socketio');
-    socketIo.emit('schedule_updated', { date: bookingDate });
-    console.log(`📢 Memancarkan 'schedule_updated' untuk tanggal: ${bookingDate}`);
+    socketIo.emit('schedule_updated', { 
+        date: bookingDate,
+        updatedSlots: updatedSlots
+    });
+    console.log(`📢 Memancarkan 'schedule_updated' untuk tanggal: ${bookingDate} dengan slot:`, updatedSlots);
 
     res.status(201).json({
       message: "Transaksi berhasil dibuat. Selesaikan pembayaran dalam 10 menit.",
@@ -322,11 +330,20 @@ app.post('/api/payment-notification', async (req, res) => {
                 { _id: orderId }, 
                 { $set: { orderStatus: newStatus, paymentResponse: statusResponse } }
             );
-             if (order.playtimes && order.playtimes.length > 0) {
+            // --- [PERUBAHAN] Kirim ID slot yang spesifik dari notifikasi ---
+            if (newStatus === 'paid' && order.playtimes && order.playtimes.length > 0) {
                 const bookingDate = format(new Date(order.playtimes[0].date), 'yyyy-MM-dd');
+                const updatedSlots = order.playtimes.map(pt => {
+                    const ptDate = format(new Date(pt.date), 'yyyy-MM-dd');
+                    return `${pt.courtName}-${ptDate}-${pt.startHour}`;
+                });
+                
                 const socketIo = req.app.get('socketio');
-                socketIo.emit('schedule_updated', { date: bookingDate });
-                console.log(`📢 Memancarkan 'schedule_updated' untuk tanggal: ${bookingDate} (dari notifikasi)`);
+                socketIo.emit('schedule_updated', { 
+                    date: bookingDate,
+                    updatedSlots: updatedSlots
+                });
+                console.log(`📢 Memancarkan 'schedule_updated' dari notifikasi untuk tanggal: ${bookingDate} dengan slot:`, updatedSlots);
             }
         }
         res.status(200).send("Notification received successfully.");
