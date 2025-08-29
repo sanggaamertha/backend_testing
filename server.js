@@ -9,7 +9,7 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const validator = require("validator");
 const midtransClient = require("midtrans-client");
-const { format } = require('date-fns');
+const { format, toDate } = require('date-fns');
 
 require("dotenv").config();
 
@@ -168,38 +168,68 @@ app.post("/api/auth/login", async (req, res) => {
 });
 
 app.get("/api/schedule", authUserMiddleware, async (req, res) => {
-  const { date } = req.query;
-  if (!date)
+  const { date } = req.query; // date is 'yyyy-MM-dd'
+  if (!date) {
     return res.status(400).json({ message: "Parameter 'date' dibutuhkan" });
+  }
   try {
     const targetDate = new Date(date + "T00:00:00.000Z");
     const dayOfWeek = targetDate.getUTCDay();
+
     const setting = await db.collection("settings").findOne({ dayOfWeek: dayOfWeek });
     if (!setting || !setting.isActive) {
       return res.status(200).json({ message: "Tutup pada hari ini.", courts: [] });
     }
+
     let event = await db.collection("events").findOne({ date: targetDate });
     let openingHour = event?.openingHour ?? setting.openingHour;
     let closingHour = event?.closingHour ?? setting.closingHour;
+
     if (event && event.isClosed) {
       return res.status(200).json({ message: `Tutup: ${event.reason}`, courts: [] });
     }
-    const regularBookings = await db.collection("orders").find({ "playtimes.date": targetDate, orderStatus: "paid" }).toArray();
+
+    // --- [PERUBAHAN] Ambil order 'paid' DAN 'pending' yang masih valid ---
+    const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
+    const bookings = await db.collection("orders").find({
+      "playtimes.date": targetDate,
+      $or: [
+        { orderStatus: "paid" },
+        { orderStatus: "pending", createdAt: { $gte: tenMinutesAgo } }
+      ]
+    }).toArray();
+
     const memberBookings = await db.collection("memberships").find({ recurringDay: dayOfWeek }).toArray();
-    const bookedSlots = new Set();
-    regularBookings.forEach((order) => {
+
+    const bookedSlots = new Map(); // Gunakan Map untuk menyimpan status
+
+    bookings.forEach((order) => {
       order.playtimes.forEach((pt) => {
-        bookedSlots.add(`${pt.courtName}-${pt.startHour}`);
+        const key = `${pt.courtName}-${pt.startHour}`;
+        // Status 0 untuk booked (paid), Status 2 untuk pending
+        bookedSlots.set(key, order.orderStatus === 'paid' ? 0 : 2);
       });
     });
+
     memberBookings.forEach((member) => {
-      bookedSlots.add(`${member.courtName}-${member.recurringHour}`);
+        const key = `${member.courtName}-${member.recurringHour}`;
+        bookedSlots.set(key, 0); // Member dianggap 'paid'
     });
+
     const courtNames = ["A", "B", "C"];
     const finalSchedule = courtNames.map((name) => {
       const playtimes = [];
       for (let hour = openingHour; hour < closingHour; hour++) {
-        const isBooked = bookedSlots.has(`${name}-${hour}`);
+        const key = `${name}-${hour}`;
+        const slotStatus = bookedSlots.get(key); // Cek status dari Map
+
+        let status;
+        if (slotStatus !== undefined) {
+            status = slotStatus; // 0 (paid) or 2 (pending)
+        } else {
+            status = 1; // 1 (available)
+        }
+        
         let price = setting.basePrice;
         if (setting.priceOverrides) {
           for (const override of setting.priceOverrides) {
@@ -209,18 +239,22 @@ app.get("/api/schedule", authUserMiddleware, async (req, res) => {
             }
           }
         }
+
+        // --- [PERUBAHAN] ID dibuat konsisten ---
+        const playtimeId = `${name}-${date}-${hour}`;
+
         playtimes.push({
-          _id: new ObjectId(),
+          id: playtimeId, // Ganti _id menjadi id
           start: `${hour.toString().padStart(2, "0")}:00`,
           end: `${(hour + 1).toString().padStart(2, "0")}:00`,
-          status: isBooked ? 0 : 1,
+          status: status, // Status dinamis (0, 1, atau 2)
           price: price,
           date: targetDate,
           startHour: hour,
           courtName: name,
         });
       }
-      return { _id: new ObjectId(), name: name, playtimes: playtimes };
+      return { id: new ObjectId(), name: name, playtimes: playtimes };
     });
     res.status(200).json({ message: "Jadwal tersedia", courts: finalSchedule });
   } catch (error) {
@@ -236,44 +270,57 @@ app.post("/api/orders", authUserMiddleware, async (req, res) => {
   if (!playtimes || playtimes.length === 0) {
     return res.status(400).json({ message: "Pilih minimal satu jadwal." });
   }
+  
+  // --- [PERUBAHAN] Gerbang Pengecekan Diperketat ---
   try {
     for (const pt of playtimes) {
       const targetDate = new Date(pt.date);
+      const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
       const existingOrder = await db.collection("orders").findOne({
-        playtimes: { $elemMatch: { courtName: pt.courtName, date: targetDate, startHour: pt.startHour } },
-        orderStatus: { $in: ["paid", "pending"] },
+          "playtimes": { 
+              $elemMatch: { 
+                  courtName: pt.courtName, 
+                  date: targetDate, 
+                  startHour: pt.startHour 
+              } 
+          },
+          $or: [
+              { "orderStatus": "paid" },
+              { "orderStatus": "pending", "createdAt": { $gte: tenMinutesAgo } }
+          ]
       });
+
       if (existingOrder) {
-        if (existingOrder.orderStatus === "paid") {
-          return res.status(409).json({ message: `Jadwal ${pt.courtName} jam ${pt.startHour}:00 sudah tidak tersedia.` });
-        }
-        if (existingOrder.orderStatus === "pending") {
-          const orderTime = new Date(existingOrder.createdAt);
-          const now = new Date();
-          const diffInMinutes = (now - orderTime) / (1000 * 60);
-          if (diffInMinutes <= 10) {
-            return res.status(409).json({ message: `Jadwal ${pt.courtName} jam ${pt.startHour}:00 sedang dalam proses booking oleh orang lain.` });
-          }
-        }
+          const message = existingOrder.orderStatus === 'paid' 
+              ? `Jadwal ${pt.courtName} jam ${pt.startHour}:00 sudah tidak tersedia.`
+              : `Jadwal ${pt.courtName} jam ${pt.startHour}:00 sedang dalam proses booking oleh orang lain.`;
+          return res.status(409).json({ message });
       }
     }
+    
     let serverTotal = 0;
     const validatedPlaytimes = [];
     const item_details = [];
+
+    const bookingDate = format(new Date(playtimes[0].date), 'yyyy-MM-dd');
+
     for (const pt of playtimes) {
       const price = await calculatePrice(pt);
       serverTotal += price;
       validatedPlaytimes.push({ courtName: pt.courtName, date: new Date(pt.date), startHour: pt.startHour, price: price });
+      const playtimeId = `${pt.courtName}-${bookingDate}-${pt.startHour}`;
       item_details.push({
-        id: `${pt.courtName}-${pt.startHour}-${new Date(pt.date).getTime()}`,
+        id: playtimeId,
         price: price,
         quantity: 1,
         name: `Booking Lap. ${pt.courtName} jam ${pt.startHour}:00`,
       });
     }
+
     const orderId = `BINTON-${new ObjectId()}`;
     const newOrder = { _id: orderId, userId, playtimes: validatedPlaytimes, total: serverTotal, orderStatus: 'pending', createdAt: new Date(), transactionToken: null };
     await db.collection('orders').insertOne(newOrder);
+
     const parameter = {
       transaction_details: { order_id: orderId, gross_amount: serverTotal },
       customer_details: { email: userEmail },
@@ -284,18 +331,20 @@ app.post("/api/orders", authUserMiddleware, async (req, res) => {
     const transactionToken = transaction.token;
     await db.collection('orders').updateOne({ _id: orderId }, { $set: { transactionToken: transactionToken } });
 
-    // --- [PERUBAHAN] Kirim ID slot yang spesifik ---
-    const bookingDate = format(new Date(playtimes[0].date), 'yyyy-MM-dd');
+    // --- [PERUBAHAN] Payload socket diperkaya dengan status ---
     const updatedSlots = playtimes.map(pt => {
-        return `${pt.courtName}-${bookingDate}-${pt.startHour}`;
+        return {
+            slotId: `${pt.courtName}-${bookingDate}-${pt.startHour}`,
+            newStatus: 2 // 2 = pending
+        };
     });
 
     const socketIo = req.app.get('socketio');
     socketIo.emit('schedule_updated', { 
         date: bookingDate,
-        updatedSlots: updatedSlots
+        slots: updatedSlots
     });
-    console.log(`📢 Memancarkan 'schedule_updated' untuk tanggal: ${bookingDate} dengan slot:`, updatedSlots);
+    console.log(`📢 Memancarkan 'schedule_updated' (pending) untuk tanggal: ${bookingDate} dengan slot:`, updatedSlots);
 
     res.status(201).json({
       message: "Transaksi berhasil dibuat. Selesaikan pembayaran dalam 10 menit.",
@@ -308,6 +357,7 @@ app.post("/api/orders", authUserMiddleware, async (req, res) => {
   }
 });
 
+
 app.post('/api/payment-notification', async (req, res) => {
     const notificationJson = req.body;
     try {
@@ -316,34 +366,44 @@ app.post('/api/payment-notification', async (req, res) => {
         const transactionStatus = statusResponse.transaction_status;
         const fraudStatus = statusResponse.fraud_status;
         const order = await db.collection('orders').findOne({ _id: orderId });
+
         if (!order || order.orderStatus === 'paid' || order.orderStatus === 'failed') {
             return res.status(200).send("Notification ignored: Order not found or already processed.");
         }
+
         let newStatus = order.orderStatus;
+        let isSuccess = false;
+
         if ((transactionStatus == 'capture' && fraudStatus == 'accept') || transactionStatus == 'settlement') {
             newStatus = 'paid';
+            isSuccess = true;
         } else if (['cancel', 'deny', 'expire'].includes(transactionStatus)) {
             newStatus = 'failed';
         }
+
         if (newStatus !== order.orderStatus) {
             await db.collection('orders').updateOne(
                 { _id: orderId }, 
                 { $set: { orderStatus: newStatus, paymentResponse: statusResponse } }
             );
-            // --- [PERUBAHAN] Kirim ID slot yang spesifik dari notifikasi ---
-            if (newStatus === 'paid' && order.playtimes && order.playtimes.length > 0) {
+
+            // --- [PERUBAHAN] Kirim status baru (paid/available) via socket ---
+            if (order.playtimes && order.playtimes.length > 0) {
                 const bookingDate = format(new Date(order.playtimes[0].date), 'yyyy-MM-dd');
                 const updatedSlots = order.playtimes.map(pt => {
                     const ptDate = format(new Date(pt.date), 'yyyy-MM-dd');
-                    return `${pt.courtName}-${ptDate}-${pt.startHour}`;
+                    return {
+                        slotId: `${pt.courtName}-${ptDate}-${pt.startHour}`,
+                        newStatus: isSuccess ? 0 : 1 // 0 = booked, 1 = available again
+                    };
                 });
                 
                 const socketIo = req.app.get('socketio');
                 socketIo.emit('schedule_updated', { 
                     date: bookingDate,
-                    updatedSlots: updatedSlots
+                    slots: updatedSlots
                 });
-                console.log(`📢 Memancarkan 'schedule_updated' dari notifikasi untuk tanggal: ${bookingDate} dengan slot:`, updatedSlots);
+                console.log(`📢 Memancarkan 'schedule_updated' (notif) untuk tanggal: ${bookingDate} dengan status: ${newStatus}`, updatedSlots);
             }
         }
         res.status(200).send("Notification received successfully.");
@@ -352,6 +412,9 @@ app.post('/api/payment-notification', async (req, res) => {
         res.status(500).send("Internal Server Error");
     }
 });
+
+// Sisanya sama, tidak ada perubahan
+// ... (endpoint /api/orders/:orderId/resume-payment, /api/my-orders, /api/profile, dan semua endpoint admin tetap sama)
 
 app.get("/api/orders/:orderId/resume-payment", authUserMiddleware, async (req, res) => {
     try {
