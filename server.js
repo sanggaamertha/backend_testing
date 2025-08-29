@@ -287,11 +287,23 @@ app.post("/api/orders", authUserMiddleware, async (req, res) => {
   const { playtimes } = req.body;
   const userId = new ObjectId(req.user.userId);
   const userEmail = req.user.email;
+
   if (!playtimes || playtimes.length === 0) {
     return res.status(400).json({ message: "Pilih minimal satu jadwal." });
   }
   
   try {
+
+    const now = new Date(); 
+    for (const pt of playtimes) {
+      const slotTime = new Date(new Date(pt.date).setHours(pt.startHour, 0, 0, 0));
+      if (now > slotTime) {
+        return res.status(400).json({ 
+          message: `Waktu untuk slot ${pt.courtName} jam ${pt.startHour}:00 sudah lewat.` 
+        });
+      }
+    }
+
     for (const pt of playtimes) {
       const targetDate = new Date(pt.date);
       const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
@@ -315,6 +327,7 @@ app.post("/api/orders", authUserMiddleware, async (req, res) => {
               : `Jadwal ${pt.courtName} jam ${pt.startHour}:00 sedang dalam proses booking oleh orang lain.`;
           return res.status(409).json({ message });
       }
+     
     }
     
     let serverTotal = 0;
