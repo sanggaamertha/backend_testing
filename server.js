@@ -75,6 +75,11 @@ MongoClient.connect(mongoUri)
     console.log("✅ Berhasil terhubung ke MongoDB Atlas");
     db = client.db(dbName);
     await initializeDefaultSettings();
+    
+    // --- [PENAMBAHAN] Jalankan pembersih otomatis setiap 1 menit ---
+    setInterval(cleanupExpiredOrders, 60 * 1000); 
+    console.log("⏰ Robot pembersih pesanan kedaluwarsa telah aktif.");
+
     server.listen(port, () => {
       console.log(`🚀 Backend server & Socket.IO berjalan di http://localhost:${port}`);
     });
@@ -129,6 +134,28 @@ async function calculatePrice(playtime) {
   }
   return price;
 }
+
+// --- [PENAMBAHAN] Fungsi untuk membersihkan pesanan yang kedaluwarsa ---
+async function cleanupExpiredOrders() {
+  try {
+    const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
+    const result = await db.collection("orders").updateMany(
+      { 
+        orderStatus: "pending", 
+        createdAt: { $lt: tenMinutesAgo } 
+      },
+      { 
+        $set: { orderStatus: "failed" } 
+      }
+    );
+    if (result.modifiedCount > 0) {
+      console.log(`🧹 Berhasil membersihkan ${result.modifiedCount} pesanan yang kedaluwarsa.`);
+    }
+  } catch (error) {
+    console.error("❌ Error saat membersihkan pesanan kedaluwarsa:", error);
+  }
+}
+
 
 // === ENDPOINTS UNTUK APLIKASI KLIEN ===
 
@@ -236,7 +263,6 @@ app.get("/api/schedule", authUserMiddleware, async (req, res) => {
         const playtimeId = `${name}-${date}-${hour}`;
 
         playtimes.push({
-          // --- [PERBAIKAN] Mengembalikan properti ke _id ---
           _id: playtimeId, 
           start: `${hour.toString().padStart(2, "0")}:00`,
           end: `${(hour + 1).toString().padStart(2, "0")}:00`,
@@ -247,7 +273,6 @@ app.get("/api/schedule", authUserMiddleware, async (req, res) => {
           courtName: name,
         });
       }
-      // --- [PERBAIKAN] Mengembalikan properti ke _id ---
       return { _id: new ObjectId(), name: name, playtimes: playtimes };
     });
     res.status(200).json({ message: "Jadwal tersedia", courts: finalSchedule });
@@ -302,7 +327,6 @@ app.post("/api/orders", authUserMiddleware, async (req, res) => {
       const price = await calculatePrice(pt);
       serverTotal += price;
       validatedPlaytimes.push({ courtName: pt.courtName, date: new Date(pt.date), startHour: pt.startHour, price: price });
-      // --- [PERBAIKAN] ID untuk item midtrans tetap menggunakan format yang sama ---
       const playtimeId = `${pt.courtName}-${bookingDate}-${pt.startHour}`;
       item_details.push({
         id: playtimeId,
@@ -328,7 +352,6 @@ app.post("/api/orders", authUserMiddleware, async (req, res) => {
 
     const updatedSlots = playtimes.map(pt => {
         return {
-            // --- [PERBAIKAN] slotId di socket disamakan dengan _id di frontend ---
             slotId: `${pt.courtName}-${bookingDate}-${pt.startHour}`,
             newStatus: 2 // 2 = pending
         };
@@ -387,9 +410,8 @@ app.post('/api/payment-notification', async (req, res) => {
                 const updatedSlots = order.playtimes.map(pt => {
                     const ptDate = format(new Date(pt.date), 'yyyy-MM-dd');
                     return {
-                        // --- [PERBAIKAN] slotId di socket disamakan dengan _id di frontend ---
                         slotId: `${pt.courtName}-${ptDate}-${pt.startHour}`,
-                        newStatus: isSuccess ? 0 : 1 // 0 = booked, 1 = available again
+                        newStatus: isSuccess ? 0 : 1
                     };
                 });
                 
