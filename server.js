@@ -1,4 +1,4 @@
-// server.js (Versi Final - Real-time dengan ID Slot Spesifik)
+// server.js (Versi Perbaikan Final dengan Firebase Admin SDK)
 
 const express = require("express");
 const http = require('http');
@@ -10,8 +10,16 @@ const jwt = require("jsonwebtoken");
 const validator = require("validator");
 const midtransClient = require("midtrans-client");
 const { format } = require('date-fns');
+const admin = require("firebase-admin"); // <-- TAMBAHAN BARU
 
 require("dotenv").config();
+
+// --- [BARU] Inisialisasi Firebase Admin SDK ---
+const serviceAccount = require("./serviceAccountKey.json");
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
+// ---------------------------------------------
 
 const app = express();
 const server = http.createServer(app);
@@ -75,9 +83,7 @@ MongoClient.connect(mongoUri)
     console.log("✅ Berhasil terhubung ke MongoDB Atlas");
     db = client.db(dbName);
     await initializeDefaultSettings();
-    
-    // --- [PENAMBAHAN] Jalankan pembersih otomatis setiap 1 menit ---
-    setInterval(cleanupExpiredOrders, 60 * 1000); 
+    setInterval(cleanupExpiredOrders, 60 * 1000);
     console.log("⏰ Robot pembersih pesanan kedaluwarsa telah aktif.");
 
     server.listen(port, () => {
@@ -92,6 +98,101 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     console.log('🔌 Klien terputus:', socket.id);
   });
+});
+
+// === ENDPOINTS AUTENTIKASI (YANG DIPERBAIKI) ===
+
+// Endpoint BARU untuk login/register via Google
+app.post("/api/auth/google-signin", async (req, res) => {
+    const { idToken } = req.body;
+    if (!idToken) {
+        return res.status(400).json({ message: "ID Token tidak ditemukan." });
+    }
+
+    try {
+        // 1. Verifikasi ID Token menggunakan Firebase Admin SDK
+        const decodedToken = await admin.auth().verifyIdToken(idToken);
+        const { uid, email, name } = decodedToken;
+
+        // 2. Cari user di database kita, atau buat baru jika belum ada
+        let user = await db.collection("users").findOne({ email });
+
+        if (!user) {
+            // User belum ada, daftarkan
+            const newUser = {
+                name: name || 'Pengguna Google',
+                email,
+                phone: decodedToken.phone_number || '',
+                firebaseUid: uid, // Simpan UID Firebase untuk referensi
+                isAdmin: false,
+                createdAt: new Date(),
+                // Tidak ada password untuk pengguna Google
+            };
+            const result = await db.collection("users").insertOne(newUser);
+            user = { ...newUser, _id: result.insertedId };
+        }
+
+        // 3. Buat JWT token kustom dari server kita
+        const customToken = jwt.sign(
+            { userId: user._id, email: user.email, isAdmin: user.isAdmin || false },
+            JWT_SECRET,
+            { expiresIn: "1d" }
+        );
+
+        // 4. Kirim token kustom dan data user kembali ke client
+        res.json({
+            token: customToken,
+            user: { id: user._id, name: user.name, email: user.email, phone: user.phone, isAdmin: user.isAdmin || false },
+        });
+
+    } catch (error) {
+        console.error("Error saat verifikasi Google Sign-In:", error);
+        res.status(401).json({ message: "Autentikasi Google gagal. Token tidak valid." });
+    }
+});
+
+// Endpoint register email biasa (tidak berubah)
+app.post("/api/auth/register", async (req, res) => {
+  try {
+    const { name, email, password, phone } = req.body;
+    if (!validator.isEmail(email) || password.length < 6)
+      return res.status(400).json({ message: "Input tidak valid." });
+    const existingUser = await db.collection("users").findOne({ email });
+    if (existingUser)
+      return res.status(400).json({ message: "Email sudah terdaftar." });
+    const hashedPassword = await bcrypt.hash(password, 12);
+    await db.collection("users").insertOne({ name, email, password: hashedPassword, phone, isAdmin: false, createdAt: new Date() });
+    res.status(201).json({ message: "Registrasi berhasil!" });
+  } catch (error) {
+    res.status(500).json({ message: "Error server." });
+  }
+});
+
+// Endpoint login email biasa (DIPERBAIKI untuk handle pengguna Google)
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const user = await db.collection("users").findOne({ email });
+    if (!user)
+      return res.status(401).json({ message: "Email atau password salah." });
+
+    // Tambahkan pengecekan jika user mendaftar via Google (tidak punya password)
+    if (!user.password) {
+        return res.status(401).json({ message: "Akun ini terdaftar melalui Google. Silakan masuk dengan Google." });
+    }
+      
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch)
+      return res.status(401).json({ message: "Email atau password salah." });
+      
+    const token = jwt.sign({ userId: user._id, email: user.email, isAdmin: user.isAdmin || false }, JWT_SECRET, { expiresIn: "1d" });
+    res.json({
+      token,
+      user: { id: user._id, name: user.name, email: user.email, phone: user.phone, isAdmin: user.isAdmin || false },
+    });
+  } catch (error) {
+    res.status(500).json({ message: "Error server." });
+  }
 });
 
 // === FUNGSI HELPER & INISIALISASI ===
@@ -159,40 +260,6 @@ async function cleanupExpiredOrders() {
 
 // === ENDPOINTS UNTUK APLIKASI KLIEN ===
 
-app.post("/api/auth/register", async (req, res) => {
-  try {
-    const { name, email, password, phone } = req.body;
-    if (!validator.isEmail(email) || password.length < 6)
-      return res.status(400).json({ message: "Input tidak valid." });
-    const existingUser = await db.collection("users").findOne({ email });
-    if (existingUser)
-      return res.status(400).json({ message: "Email sudah terdaftar." });
-    const hashedPassword = await bcrypt.hash(password, 12);
-    await db.collection("users").insertOne({ name, email, password: hashedPassword, phone, isAdmin: false, createdAt: new Date() });
-    res.status(201).json({ message: "Registrasi berhasil!" });
-  } catch (error) {
-    res.status(500).json({ message: "Error server." });
-  }
-});
-
-app.post("/api/auth/login", async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    const user = await db.collection("users").findOne({ email });
-    if (!user)
-      return res.status(401).json({ message: "Email atau password salah." });
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch)
-      return res.status(401).json({ message: "Email atau password salah." });
-    const token = jwt.sign({ userId: user._id, email: user.email, isAdmin: user.isAdmin || false }, JWT_SECRET, { expiresIn: "1d" });
-    res.json({
-      token,
-      user: { id: user._id, name: user.name, email: user.email, phone: user.phone, isAdmin: user.isAdmin || false },
-    });
-  } catch (error) {
-    res.status(500).json({ message: "Error server." });
-  }
-});
 
 app.get("/api/schedule", authUserMiddleware, async (req, res) => {
   const { date } = req.query; // date is 'yyyy-MM-dd'
