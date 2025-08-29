@@ -9,7 +9,7 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const validator = require("validator");
 const midtransClient = require("midtrans-client");
-const { format, toDate } = require('date-fns');
+const { format } = require('date-fns');
 
 require("dotenv").config();
 
@@ -189,7 +189,6 @@ app.get("/api/schedule", authUserMiddleware, async (req, res) => {
       return res.status(200).json({ message: `Tutup: ${event.reason}`, courts: [] });
     }
 
-    // --- [PERUBAHAN] Ambil order 'paid' DAN 'pending' yang masih valid ---
     const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
     const bookings = await db.collection("orders").find({
       "playtimes.date": targetDate,
@@ -201,19 +200,18 @@ app.get("/api/schedule", authUserMiddleware, async (req, res) => {
 
     const memberBookings = await db.collection("memberships").find({ recurringDay: dayOfWeek }).toArray();
 
-    const bookedSlots = new Map(); // Gunakan Map untuk menyimpan status
+    const bookedSlots = new Map();
 
     bookings.forEach((order) => {
       order.playtimes.forEach((pt) => {
         const key = `${pt.courtName}-${pt.startHour}`;
-        // Status 0 untuk booked (paid), Status 2 untuk pending
         bookedSlots.set(key, order.orderStatus === 'paid' ? 0 : 2);
       });
     });
 
     memberBookings.forEach((member) => {
         const key = `${member.courtName}-${member.recurringHour}`;
-        bookedSlots.set(key, 0); // Member dianggap 'paid'
+        bookedSlots.set(key, 0);
     });
 
     const courtNames = ["A", "B", "C"];
@@ -221,14 +219,9 @@ app.get("/api/schedule", authUserMiddleware, async (req, res) => {
       const playtimes = [];
       for (let hour = openingHour; hour < closingHour; hour++) {
         const key = `${name}-${hour}`;
-        const slotStatus = bookedSlots.get(key); // Cek status dari Map
+        const slotStatus = bookedSlots.get(key);
 
-        let status;
-        if (slotStatus !== undefined) {
-            status = slotStatus; // 0 (paid) or 2 (pending)
-        } else {
-            status = 1; // 1 (available)
-        }
+        let status = (slotStatus !== undefined) ? slotStatus : 1;
         
         let price = setting.basePrice;
         if (setting.priceOverrides) {
@@ -240,21 +233,22 @@ app.get("/api/schedule", authUserMiddleware, async (req, res) => {
           }
         }
 
-        // --- [PERUBAHAN] ID dibuat konsisten ---
         const playtimeId = `${name}-${date}-${hour}`;
 
         playtimes.push({
-          id: playtimeId, // Ganti _id menjadi id
+          // --- [PERBAIKAN] Mengembalikan properti ke _id ---
+          _id: playtimeId, 
           start: `${hour.toString().padStart(2, "0")}:00`,
           end: `${(hour + 1).toString().padStart(2, "0")}:00`,
-          status: status, // Status dinamis (0, 1, atau 2)
+          status: status,
           price: price,
           date: targetDate,
           startHour: hour,
           courtName: name,
         });
       }
-      return { id: new ObjectId(), name: name, playtimes: playtimes };
+      // --- [PERBAIKAN] Mengembalikan properti ke _id ---
+      return { _id: new ObjectId(), name: name, playtimes: playtimes };
     });
     res.status(200).json({ message: "Jadwal tersedia", courts: finalSchedule });
   } catch (error) {
@@ -262,6 +256,7 @@ app.get("/api/schedule", authUserMiddleware, async (req, res) => {
     res.status(500).json({ message: "Terjadi kesalahan pada server" });
   }
 });
+
 
 app.post("/api/orders", authUserMiddleware, async (req, res) => {
   const { playtimes } = req.body;
@@ -271,7 +266,6 @@ app.post("/api/orders", authUserMiddleware, async (req, res) => {
     return res.status(400).json({ message: "Pilih minimal satu jadwal." });
   }
   
-  // --- [PERUBAHAN] Gerbang Pengecekan Diperketat ---
   try {
     for (const pt of playtimes) {
       const targetDate = new Date(pt.date);
@@ -308,6 +302,7 @@ app.post("/api/orders", authUserMiddleware, async (req, res) => {
       const price = await calculatePrice(pt);
       serverTotal += price;
       validatedPlaytimes.push({ courtName: pt.courtName, date: new Date(pt.date), startHour: pt.startHour, price: price });
+      // --- [PERBAIKAN] ID untuk item midtrans tetap menggunakan format yang sama ---
       const playtimeId = `${pt.courtName}-${bookingDate}-${pt.startHour}`;
       item_details.push({
         id: playtimeId,
@@ -331,9 +326,9 @@ app.post("/api/orders", authUserMiddleware, async (req, res) => {
     const transactionToken = transaction.token;
     await db.collection('orders').updateOne({ _id: orderId }, { $set: { transactionToken: transactionToken } });
 
-    // --- [PERUBAHAN] Payload socket diperkaya dengan status ---
     const updatedSlots = playtimes.map(pt => {
         return {
+            // --- [PERBAIKAN] slotId di socket disamakan dengan _id di frontend ---
             slotId: `${pt.courtName}-${bookingDate}-${pt.startHour}`,
             newStatus: 2 // 2 = pending
         };
@@ -386,13 +381,13 @@ app.post('/api/payment-notification', async (req, res) => {
                 { _id: orderId }, 
                 { $set: { orderStatus: newStatus, paymentResponse: statusResponse } }
             );
-
-            // --- [PERUBAHAN] Kirim status baru (paid/available) via socket ---
+            
             if (order.playtimes && order.playtimes.length > 0) {
                 const bookingDate = format(new Date(order.playtimes[0].date), 'yyyy-MM-dd');
                 const updatedSlots = order.playtimes.map(pt => {
                     const ptDate = format(new Date(pt.date), 'yyyy-MM-dd');
                     return {
+                        // --- [PERBAIKAN] slotId di socket disamakan dengan _id di frontend ---
                         slotId: `${pt.courtName}-${ptDate}-${pt.startHour}`,
                         newStatus: isSuccess ? 0 : 1 // 0 = booked, 1 = available again
                     };
@@ -412,9 +407,6 @@ app.post('/api/payment-notification', async (req, res) => {
         res.status(500).send("Internal Server Error");
     }
 });
-
-// Sisanya sama, tidak ada perubahan
-// ... (endpoint /api/orders/:orderId/resume-payment, /api/my-orders, /api/profile, dan semua endpoint admin tetap sama)
 
 app.get("/api/orders/:orderId/resume-payment", authUserMiddleware, async (req, res) => {
     try {
