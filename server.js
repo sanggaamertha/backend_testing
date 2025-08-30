@@ -15,7 +15,7 @@ const admin = require("firebase-admin"); // <-- TAMBAHAN BARU
 require("dotenv").config();
 
 // --- [BARU] Inisialisasi Firebase Admin SDK ---
-const serviceAccount = require("./serviceAccountKey.json");
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
 });
