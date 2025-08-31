@@ -1,7 +1,7 @@
 // server.js (Versi Perbaikan Final dengan Firebase Admin SDK)
 
 const express = require("express");
-const http = require('http');
+const http = require("http");
 const { Server } = require("socket.io");
 const { MongoClient, ObjectId } = require("mongodb");
 const cors = require("cors");
@@ -9,7 +9,7 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const validator = require("validator");
 const midtransClient = require("midtrans-client");
-const { format } = require('date-fns');
+const { format } = require("date-fns");
 const admin = require("firebase-admin"); // <-- TAMBAHAN BARU
 
 require("dotenv").config();
@@ -17,7 +17,7 @@ require("dotenv").config();
 // --- [BARU] Inisialisasi Firebase Admin SDK ---
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
+  credential: admin.credential.cert(serviceAccount),
 });
 // ---------------------------------------------
 
@@ -27,8 +27,8 @@ const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
     origin: "*",
-    methods: ["GET", "POST"]
-  }
+    methods: ["GET", "POST"],
+  },
 });
 
 const port = process.env.PORT || 3000;
@@ -47,7 +47,7 @@ const snap = new midtransClient.Snap({
 });
 
 let db;
-app.set('socketio', io);
+app.set("socketio", io);
 
 // --- MIDDLEWARE ---
 app.use(cors());
@@ -70,7 +70,9 @@ const authAdminMiddleware = (req, res, next) => {
   if (token == null) return res.sendStatus(401);
   jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err || !user.isAdmin) {
-      return res.status(403).json({ message: "Akses ditolak. Hanya untuk admin." });
+      return res
+        .status(403)
+        .json({ message: "Akses ditolak. Hanya untuk admin." });
     }
     req.user = user;
     next();
@@ -87,16 +89,18 @@ MongoClient.connect(mongoUri)
     console.log("⏰ Robot pembersih pesanan kedaluwarsa telah aktif.");
 
     server.listen(port, () => {
-      console.log(`🚀 Backend server & Socket.IO berjalan di http://localhost:${port}`);
+      console.log(
+        `🚀 Backend server & Socket.IO berjalan di http://localhost:${port}`
+      );
     });
   })
   .catch((error) => console.error("❌ Gagal terhubung ke MongoDB:", error));
 
 // --- LOGIKA KONEKSI SOCKET.IO ---
-io.on('connection', (socket) => {
-  console.log('🔌 Klien baru terhubung:', socket.id);
-  socket.on('disconnect', () => {
-    console.log('🔌 Klien terputus:', socket.id);
+io.on("connection", (socket) => {
+  console.log("🔌 Klien baru terhubung:", socket.id);
+  socket.on("disconnect", () => {
+    console.log("🔌 Klien terputus:", socket.id);
   });
 });
 
@@ -104,51 +108,58 @@ io.on('connection', (socket) => {
 
 // Endpoint BARU untuk login/register via Google
 app.post("/api/auth/google-signin", async (req, res) => {
-    const { idToken } = req.body;
-    if (!idToken) {
-        return res.status(400).json({ message: "ID Token tidak ditemukan." });
+  const { idToken } = req.body;
+  if (!idToken) {
+    return res.status(400).json({ message: "ID Token tidak ditemukan." });
+  }
+
+  try {
+    // 1. Verifikasi ID Token menggunakan Firebase Admin SDK
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    const { uid, email, name } = decodedToken;
+
+    // 2. Cari user di database kita, atau buat baru jika belum ada
+    let user = await db.collection("users").findOne({ email });
+
+    if (!user) {
+      // User belum ada, daftarkan
+      const newUser = {
+        name: name || "Pengguna Google",
+        email,
+        phone: decodedToken.phone_number || "",
+        firebaseUid: uid, // Simpan UID Firebase untuk referensi
+        isAdmin: false,
+        createdAt: new Date(),
+        // Tidak ada password untuk pengguna Google
+      };
+      const result = await db.collection("users").insertOne(newUser);
+      user = { ...newUser, _id: result.insertedId };
     }
 
-    try {
-        // 1. Verifikasi ID Token menggunakan Firebase Admin SDK
-        const decodedToken = await admin.auth().verifyIdToken(idToken);
-        const { uid, email, name } = decodedToken;
+    // 3. Buat JWT token kustom dari server kita
+    const customToken = jwt.sign(
+      { userId: user._id, email: user.email, isAdmin: user.isAdmin || false },
+      JWT_SECRET,
+      { expiresIn: "1d" }
+    );
 
-        // 2. Cari user di database kita, atau buat baru jika belum ada
-        let user = await db.collection("users").findOne({ email });
-
-        if (!user) {
-            // User belum ada, daftarkan
-            const newUser = {
-                name: name || 'Pengguna Google',
-                email,
-                phone: decodedToken.phone_number || '',
-                firebaseUid: uid, // Simpan UID Firebase untuk referensi
-                isAdmin: false,
-                createdAt: new Date(),
-                // Tidak ada password untuk pengguna Google
-            };
-            const result = await db.collection("users").insertOne(newUser);
-            user = { ...newUser, _id: result.insertedId };
-        }
-
-        // 3. Buat JWT token kustom dari server kita
-        const customToken = jwt.sign(
-            { userId: user._id, email: user.email, isAdmin: user.isAdmin || false },
-            JWT_SECRET,
-            { expiresIn: "1d" }
-        );
-
-        // 4. Kirim token kustom dan data user kembali ke client
-        res.json({
-            token: customToken,
-            user: { id: user._id, name: user.name, email: user.email, phone: user.phone, isAdmin: user.isAdmin || false },
-        });
-
-    } catch (error) {
-        console.error("Error saat verifikasi Google Sign-In:", error);
-        res.status(401).json({ message: "Autentikasi Google gagal. Token tidak valid." });
-    }
+    // 4. Kirim token kustom dan data user kembali ke client
+    res.json({
+      token: customToken,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        isAdmin: user.isAdmin || false,
+      },
+    });
+  } catch (error) {
+    console.error("Error saat verifikasi Google Sign-In:", error);
+    res
+      .status(401)
+      .json({ message: "Autentikasi Google gagal. Token tidak valid." });
+  }
 });
 
 // Endpoint register email biasa (tidak berubah)
@@ -161,7 +172,16 @@ app.post("/api/auth/register", async (req, res) => {
     if (existingUser)
       return res.status(400).json({ message: "Email sudah terdaftar." });
     const hashedPassword = await bcrypt.hash(password, 12);
-    await db.collection("users").insertOne({ name, email, password: hashedPassword, phone, isAdmin: false, createdAt: new Date() });
+    await db
+      .collection("users")
+      .insertOne({
+        name,
+        email,
+        password: hashedPassword,
+        phone,
+        isAdmin: false,
+        createdAt: new Date(),
+      });
     res.status(201).json({ message: "Registrasi berhasil!" });
   } catch (error) {
     res.status(500).json({ message: "Error server." });
@@ -178,17 +198,32 @@ app.post("/api/auth/login", async (req, res) => {
 
     // Tambahkan pengecekan jika user mendaftar via Google (tidak punya password)
     if (!user.password) {
-        return res.status(401).json({ message: "Akun ini terdaftar melalui Google. Silakan masuk dengan Google." });
+      return res
+        .status(401)
+        .json({
+          message:
+            "Akun ini terdaftar melalui Google. Silakan masuk dengan Google.",
+        });
     }
-      
+
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch)
       return res.status(401).json({ message: "Email atau password salah." });
-      
-    const token = jwt.sign({ userId: user._id, email: user.email, isAdmin: user.isAdmin || false }, JWT_SECRET, { expiresIn: "1d" });
+
+    const token = jwt.sign(
+      { userId: user._id, email: user.email, isAdmin: user.isAdmin || false },
+      JWT_SECRET,
+      { expiresIn: "1d" }
+    );
     res.json({
       token,
-      user: { id: user._id, name: user.name, email: user.email, phone: user.phone, isAdmin: user.isAdmin || false },
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        isAdmin: user.isAdmin || false,
+      },
     });
   } catch (error) {
     res.status(500).json({ message: "Error server." });
@@ -202,7 +237,15 @@ async function initializeDefaultSettings() {
   if (count === 0) {
     console.log("🌱 Inisialisasi pengaturan jadwal default...");
     const defaultSettings = [];
-    const days = ["Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"];
+    const days = [
+      "Minggu",
+      "Senin",
+      "Selasa",
+      "Rabu",
+      "Kamis",
+      "Jumat",
+      "Sabtu",
+    ];
     for (let i = 0; i < 7; i++) {
       defaultSettings.push({
         dayOfWeek: i,
@@ -227,7 +270,10 @@ async function calculatePrice(playtime) {
   let price = setting.basePrice;
   if (setting.priceOverrides) {
     for (const override of setting.priceOverrides) {
-      if (playtime.startHour >= override.fromHour && playtime.startHour < override.toHour) {
+      if (
+        playtime.startHour >= override.fromHour &&
+        playtime.startHour < override.toHour
+      ) {
         price = override.price;
         break;
       }
@@ -241,25 +287,25 @@ async function cleanupExpiredOrders() {
   try {
     const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
     const result = await db.collection("orders").updateMany(
-      { 
-        orderStatus: "pending", 
-        createdAt: { $lt: tenMinutesAgo } 
+      {
+        orderStatus: "pending",
+        createdAt: { $lt: tenMinutesAgo },
       },
-      { 
-        $set: { orderStatus: "failed" } 
+      {
+        $set: { orderStatus: "failed" },
       }
     );
     if (result.modifiedCount > 0) {
-      console.log(`🧹 Berhasil membersihkan ${result.modifiedCount} pesanan yang kedaluwarsa.`);
+      console.log(
+        `🧹 Berhasil membersihkan ${result.modifiedCount} pesanan yang kedaluwarsa.`
+      );
     }
   } catch (error) {
     console.error("❌ Error saat membersihkan pesanan kedaluwarsa:", error);
   }
 }
 
-
 // === ENDPOINTS UNTUK APLIKASI KLIEN ===
-
 
 app.get("/api/schedule", authUserMiddleware, async (req, res) => {
   const { date } = req.query; // date is 'yyyy-MM-dd'
@@ -270,9 +316,13 @@ app.get("/api/schedule", authUserMiddleware, async (req, res) => {
     const targetDate = new Date(date + "T00:00:00.000Z");
     const dayOfWeek = targetDate.getUTCDay();
 
-    const setting = await db.collection("settings").findOne({ dayOfWeek: dayOfWeek });
+    const setting = await db
+      .collection("settings")
+      .findOne({ dayOfWeek: dayOfWeek });
     if (!setting || !setting.isActive) {
-      return res.status(200).json({ message: "Tutup pada hari ini.", courts: [] });
+      return res
+        .status(200)
+        .json({ message: "Tutup pada hari ini.", courts: [] });
     }
 
     let event = await db.collection("events").findOne({ date: targetDate });
@@ -280,32 +330,40 @@ app.get("/api/schedule", authUserMiddleware, async (req, res) => {
     let closingHour = event?.closingHour ?? setting.closingHour;
 
     if (event && event.isClosed) {
-      return res.status(200).json({ message: `Tutup: ${event.reason}`, courts: [] });
+      return res
+        .status(200)
+        .json({ message: `Tutup: ${event.reason}`, courts: [] });
     }
 
     const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
-    const bookings = await db.collection("orders").find({
-      "playtimes.date": targetDate,
-      $or: [
-        { orderStatus: "paid" },
-        { orderStatus: "pending", createdAt: { $gte: tenMinutesAgo } }
-      ]
-    }).toArray();
+    const bookings = await db
+      .collection("orders")
+      .find({
+        "playtimes.date": targetDate,
+        $or: [
+          { orderStatus: "paid" },
+          { orderStatus: "pending", createdAt: { $gte: tenMinutesAgo } },
+        ],
+      })
+      .toArray();
 
-    const memberBookings = await db.collection("memberships").find({ recurringDay: dayOfWeek }).toArray();
+    const memberBookings = await db
+      .collection("memberships")
+      .find({ recurringDay: dayOfWeek })
+      .toArray();
 
     const bookedSlots = new Map();
 
     bookings.forEach((order) => {
       order.playtimes.forEach((pt) => {
         const key = `${pt.courtName}-${pt.startHour}`;
-        bookedSlots.set(key, order.orderStatus === 'paid' ? 0 : 2);
+        bookedSlots.set(key, order.orderStatus === "paid" ? 0 : 2);
       });
     });
 
     memberBookings.forEach((member) => {
-        const key = `${member.courtName}-${member.recurringHour}`;
-        bookedSlots.set(key, 0);
+      const key = `${member.courtName}-${member.recurringHour}`;
+      bookedSlots.set(key, 0);
     });
 
     const courtNames = ["A", "B", "C"];
@@ -315,8 +373,8 @@ app.get("/api/schedule", authUserMiddleware, async (req, res) => {
         const key = `${name}-${hour}`;
         const slotStatus = bookedSlots.get(key);
 
-        let status = (slotStatus !== undefined) ? slotStatus : 1;
-        
+        let status = slotStatus !== undefined ? slotStatus : 1;
+
         let price = setting.basePrice;
         if (setting.priceOverrides) {
           for (const override of setting.priceOverrides) {
@@ -330,7 +388,7 @@ app.get("/api/schedule", authUserMiddleware, async (req, res) => {
         const playtimeId = `${name}-${date}-${hour}`;
 
         playtimes.push({
-          _id: playtimeId, 
+          _id: playtimeId,
           start: `${hour.toString().padStart(2, "0")}:00`,
           end: `${(hour + 1).toString().padStart(2, "0")}:00`,
           status: status,
@@ -349,7 +407,6 @@ app.get("/api/schedule", authUserMiddleware, async (req, res) => {
   }
 });
 
-
 app.post("/api/orders", authUserMiddleware, async (req, res) => {
   const { playtimes } = req.body;
   const userId = new ObjectId(req.user.userId);
@@ -358,15 +415,16 @@ app.post("/api/orders", authUserMiddleware, async (req, res) => {
   if (!playtimes || playtimes.length === 0) {
     return res.status(400).json({ message: "Pilih minimal satu jadwal." });
   }
-  
-  try {
 
-    const now = new Date(); 
+  try {
+    const now = new Date();
     for (const pt of playtimes) {
-      const slotTime = new Date(new Date(pt.date).setHours(pt.startHour, 0, 0, 0));
+      const slotTime = new Date(
+        new Date(pt.date).setHours(pt.startHour, 0, 0, 0)
+      );
       if (now > slotTime) {
-        return res.status(400).json({ 
-          message: `Waktu untuk slot ${pt.courtName} jam ${pt.startHour}:00 sudah lewat.` 
+        return res.status(400).json({
+          message: `Waktu untuk slot ${pt.courtName} jam ${pt.startHour}:00 sudah lewat.`,
         });
       }
     }
@@ -375,38 +433,43 @@ app.post("/api/orders", authUserMiddleware, async (req, res) => {
       const targetDate = new Date(pt.date);
       const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
       const existingOrder = await db.collection("orders").findOne({
-          "playtimes": { 
-              $elemMatch: { 
-                  courtName: pt.courtName, 
-                  date: targetDate, 
-                  startHour: pt.startHour 
-              } 
+        playtimes: {
+          $elemMatch: {
+            courtName: pt.courtName,
+            date: targetDate,
+            startHour: pt.startHour,
           },
-          $or: [
-              { "orderStatus": "paid" },
-              { "orderStatus": "pending", "createdAt": { $gte: tenMinutesAgo } }
-          ]
+        },
+        $or: [
+          { orderStatus: "paid" },
+          { orderStatus: "pending", createdAt: { $gte: tenMinutesAgo } },
+        ],
       });
 
       if (existingOrder) {
-          const message = existingOrder.orderStatus === 'paid' 
-              ? `Jadwal ${pt.courtName} jam ${pt.startHour}:00 sudah tidak tersedia.`
-              : `Jadwal ${pt.courtName} jam ${pt.startHour}:00 sedang dalam proses booking oleh orang lain.`;
-          return res.status(409).json({ message });
+        const message =
+          existingOrder.orderStatus === "paid"
+            ? `Jadwal ${pt.courtName} jam ${pt.startHour}:00 sudah tidak tersedia.`
+            : `Jadwal ${pt.courtName} jam ${pt.startHour}:00 sedang dalam proses booking oleh orang lain.`;
+        return res.status(409).json({ message });
       }
-     
     }
-    
+
     let serverTotal = 0;
     const validatedPlaytimes = [];
     const item_details = [];
 
-    const bookingDate = format(new Date(playtimes[0].date), 'yyyy-MM-dd');
+    const bookingDate = format(new Date(playtimes[0].date), "yyyy-MM-dd");
 
     for (const pt of playtimes) {
       const price = await calculatePrice(pt);
       serverTotal += price;
-      validatedPlaytimes.push({ courtName: pt.courtName, date: new Date(pt.date), startHour: pt.startHour, price: price });
+      validatedPlaytimes.push({
+        courtName: pt.courtName,
+        date: new Date(pt.date),
+        startHour: pt.startHour,
+        price: price,
+      });
       const playtimeId = `${pt.courtName}-${bookingDate}-${pt.startHour}`;
       item_details.push({
         id: playtimeId,
@@ -417,37 +480,54 @@ app.post("/api/orders", authUserMiddleware, async (req, res) => {
     }
 
     const orderId = `BINTON-${new ObjectId()}`;
-    const newOrder = { _id: orderId, userId, playtimes: validatedPlaytimes, total: serverTotal, orderStatus: 'pending', createdAt: new Date(), transactionToken: null };
-    await db.collection('orders').insertOne(newOrder);
+    const newOrder = {
+      _id: orderId,
+      userId,
+      playtimes: validatedPlaytimes,
+      total: serverTotal,
+      orderStatus: "pending",
+      createdAt: new Date(),
+      transactionToken: null,
+    };
+    await db.collection("orders").insertOne(newOrder);
 
     const parameter = {
       transaction_details: { order_id: orderId, gross_amount: serverTotal },
       customer_details: { email: userEmail },
       item_details: item_details,
-      expiry: { unit: "minute", duration: 10 }
+      expiry: { unit: "minute", duration: 10 },
     };
     const transaction = await snap.createTransaction(parameter);
     const transactionToken = transaction.token;
-    await db.collection('orders').updateOne({ _id: orderId }, { $set: { transactionToken: transactionToken } });
+    await db
+      .collection("orders")
+      .updateOne(
+        { _id: orderId },
+        { $set: { transactionToken: transactionToken } }
+      );
 
-    const updatedSlots = playtimes.map(pt => {
-        return {
-            slotId: `${pt.courtName}-${bookingDate}-${pt.startHour}`,
-            newStatus: 2 // 2 = pending
-        };
+    const updatedSlots = playtimes.map((pt) => {
+      return {
+        slotId: `${pt.courtName}-${bookingDate}-${pt.startHour}`,
+        newStatus: 2, // 2 = pending
+      };
     });
 
-    const socketIo = req.app.get('socketio');
-    socketIo.emit('schedule_updated', { 
-        date: bookingDate,
-        slots: updatedSlots
+    const socketIo = req.app.get("socketio");
+    socketIo.emit("schedule_updated", {
+      date: bookingDate,
+      slots: updatedSlots,
     });
-    console.log(`📢 Memancarkan 'schedule_updated' (pending) untuk tanggal: ${bookingDate} dengan slot:`, updatedSlots);
+    console.log(
+      `📢 Memancarkan 'schedule_updated' (pending) untuk tanggal: ${bookingDate} dengan slot:`,
+      updatedSlots
+    );
 
     res.status(201).json({
-      message: "Transaksi berhasil dibuat. Selesaikan pembayaran dalam 10 menit.",
+      message:
+        "Transaksi berhasil dibuat. Selesaikan pembayaran dalam 10 menit.",
       transactionToken,
-      orderId: orderId
+      orderId: orderId,
     });
   } catch (error) {
     console.error("Booking Error:", error);
@@ -455,62 +535,83 @@ app.post("/api/orders", authUserMiddleware, async (req, res) => {
   }
 });
 
+app.post("/api/payment-notification", async (req, res) => {
+  const notificationJson = req.body;
+  try {
+    const statusResponse = await snap.transaction.notification(
+      notificationJson
+    );
+    const orderId = statusResponse.order_id;
+    const transactionStatus = statusResponse.transaction_status;
+    const fraudStatus = statusResponse.fraud_status;
+    const order = await db.collection("orders").findOne({ _id: orderId });
 
-app.post('/api/payment-notification', async (req, res) => {
-    const notificationJson = req.body;
-    try {
-        const statusResponse = await snap.transaction.notification(notificationJson);
-        const orderId = statusResponse.order_id;
-        const transactionStatus = statusResponse.transaction_status;
-        const fraudStatus = statusResponse.fraud_status;
-        const order = await db.collection('orders').findOne({ _id: orderId });
-
-        if (!order || order.orderStatus === 'paid' || order.orderStatus === 'failed') {
-            return res.status(200).send("Notification ignored: Order not found or already processed.");
-        }
-
-        let newStatus = order.orderStatus;
-        let isSuccess = false;
-
-        if ((transactionStatus == 'capture' && fraudStatus == 'accept') || transactionStatus == 'settlement') {
-            newStatus = 'paid';
-            isSuccess = true;
-        } else if (['cancel', 'deny', 'expire'].includes(transactionStatus)) {
-            newStatus = 'failed';
-        }
-
-        if (newStatus !== order.orderStatus) {
-            await db.collection('orders').updateOne(
-                { _id: orderId }, 
-                { $set: { orderStatus: newStatus, paymentResponse: statusResponse } }
-            );
-            
-            if (order.playtimes && order.playtimes.length > 0) {
-                const bookingDate = format(new Date(order.playtimes[0].date), 'yyyy-MM-dd');
-                const updatedSlots = order.playtimes.map(pt => {
-                    const ptDate = format(new Date(pt.date), 'yyyy-MM-dd');
-                    return {
-                        slotId: `${pt.courtName}-${ptDate}-${pt.startHour}`,
-                        newStatus: isSuccess ? 0 : 1
-                    };
-                });
-                
-                const socketIo = req.app.get('socketio');
-                socketIo.emit('schedule_updated', { 
-                    date: bookingDate,
-                    slots: updatedSlots
-                });
-                console.log(`📢 Memancarkan 'schedule_updated' (notif) untuk tanggal: ${bookingDate} dengan status: ${newStatus}`, updatedSlots);
-            }
-        }
-        res.status(200).send("Notification received successfully.");
-    } catch (error) {
-        console.error("Notification Error:", error)
-        res.status(500).send("Internal Server Error");
+    if (
+      !order ||
+      order.orderStatus === "paid" ||
+      order.orderStatus === "failed"
+    ) {
+      return res
+        .status(200)
+        .send("Notification ignored: Order not found or already processed.");
     }
+
+    let newStatus = order.orderStatus;
+    let isSuccess = false;
+
+    if (
+      (transactionStatus == "capture" && fraudStatus == "accept") ||
+      transactionStatus == "settlement"
+    ) {
+      newStatus = "paid";
+      isSuccess = true;
+    } else if (["cancel", "deny", "expire"].includes(transactionStatus)) {
+      newStatus = "failed";
+    }
+
+    if (newStatus !== order.orderStatus) {
+      await db
+        .collection("orders")
+        .updateOne(
+          { _id: orderId },
+          { $set: { orderStatus: newStatus, paymentResponse: statusResponse } }
+        );
+
+      if (order.playtimes && order.playtimes.length > 0) {
+        const bookingDate = format(
+          new Date(order.playtimes[0].date),
+          "yyyy-MM-dd"
+        );
+        const updatedSlots = order.playtimes.map((pt) => {
+          const ptDate = format(new Date(pt.date), "yyyy-MM-dd");
+          return {
+            slotId: `${pt.courtName}-${ptDate}-${pt.startHour}`,
+            newStatus: isSuccess ? 0 : 1,
+          };
+        });
+
+        const socketIo = req.app.get("socketio");
+        socketIo.emit("schedule_updated", {
+          date: bookingDate,
+          slots: updatedSlots,
+        });
+        console.log(
+          `📢 Memancarkan 'schedule_updated' (notif) untuk tanggal: ${bookingDate} dengan status: ${newStatus}`,
+          updatedSlots
+        );
+      }
+    }
+    res.status(200).send("Notification received successfully.");
+  } catch (error) {
+    console.error("Notification Error:", error);
+    res.status(500).send("Internal Server Error");
+  }
 });
 
-app.get("/api/orders/:orderId/resume-payment", authUserMiddleware, async (req, res) => {
+app.get(
+  "/api/orders/:orderId/resume-payment",
+  authUserMiddleware,
+  async (req, res) => {
     try {
       const { orderId } = req.params;
       const userId = new ObjectId(req.user.userId);
@@ -522,29 +623,82 @@ app.get("/api/orders/:orderId/resume-payment", authUserMiddleware, async (req, r
         return res.status(403).json({ message: "Akses ditolak." });
       }
       if (order.orderStatus !== "pending") {
-        return res.status(400).json({ message: `Pesanan ini sudah ${order.orderStatus}.` });
+        return res
+          .status(400)
+          .json({ message: `Pesanan ini sudah ${order.orderStatus}.` });
       }
       const now = new Date();
       const orderTime = new Date(order.createdAt);
       const diffInMinutes = (now - orderTime) / (1000 * 60);
       if (diffInMinutes > 10) {
-        await db.collection("orders").updateOne({ _id: orderId }, { $set: { orderStatus: "failed" } });
-        return res.status(410).json({ message: "Waktu pembayaran sudah habis." });
+        await db
+          .collection("orders")
+          .updateOne({ _id: orderId }, { $set: { orderStatus: "failed" } });
+        return res
+          .status(410)
+          .json({ message: "Waktu pembayaran sudah habis." });
       }
       res.status(200).json({ transactionToken: order.transactionToken });
     } catch (error) {
       console.error("Resume Payment Error:", error);
       res.status(500).json({ message: "Gagal melanjutkan pembayaran." });
     }
-});
+  }
+);
 
 app.get("/api/my-orders", authUserMiddleware, async (req, res) => {
   try {
     const userId = new ObjectId(req.user.userId);
-    const orders = await db.collection("orders").find({ userId: userId }).sort({ createdAt: -1 }).toArray();
+    const orders = await db
+      .collection("orders")
+      .find({ userId: userId })
+      .sort({ createdAt: -1 })
+      .toArray();
     res.status(200).json(orders);
   } catch (error) {
     res.status(500).json({ message: "Gagal mengambil data pesanan." });
+  }
+});
+
+app.delete("/api/orders/:orderId", authUserMiddleware, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const userId = new ObjectId(req.user.userId);
+
+    const order = await db.collection("orders").findOne({ _id: orderId });
+
+    // Cek 1: Pesanan ada atau tidak
+    if (!order) {
+      return res.status(404).json({ message: "Pesanan tidak ditemukan." });
+    }
+
+    // Cek 2: Apakah pesanan ini milik user yang sedang login
+    if (!order.userId.equals(userId)) {
+      return res
+        .status(403)
+        .json({ message: "Anda tidak berhak menghapus pesanan ini." });
+    }
+
+    // Cek 3: Aturan 3 hari
+    const threeDaysAgo = new Date();
+    threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
+
+    if (new Date(order.createdAt) > threeDaysAgo) {
+      return res
+        .status(400)
+        .json({
+          message:
+            "Pesanan yang baru (kurang dari 3 hari) tidak dapat dihapus.",
+        });
+    }
+
+    // Jika semua cek lolos, hapus pesanan
+    await db.collection("orders").deleteOne({ _id: orderId });
+
+    res.status(200).json({ message: "Riwayat pesanan berhasil dihapus." });
+  } catch (error) {
+    console.error("Delete Order Error:", error);
+    res.status(500).json({ message: "Gagal menghapus pesanan." });
   }
 });
 
@@ -553,12 +707,20 @@ app.put("/api/profile", authUserMiddleware, async (req, res) => {
     const userId = new ObjectId(req.user.userId);
     const { name, phone } = req.body;
     if (!name || !phone)
-      return res.status(400).json({ message: "Nama dan nomor telepon tidak boleh kosong." });
-    await db.collection("users").updateOne({ _id: userId }, { $set: { name: name, phone: phone } });
-    const updatedUser = await db.collection("users").findOne({ _id: userId }, { projection: { password: 0 } });
+      return res
+        .status(400)
+        .json({ message: "Nama dan nomor telepon tidak boleh kosong." });
+    await db
+      .collection("users")
+      .updateOne({ _id: userId }, { $set: { name: name, phone: phone } });
+    const updatedUser = await db
+      .collection("users")
+      .findOne({ _id: userId }, { projection: { password: 0 } });
     updatedUser.id = updatedUser._id;
     delete updatedUser._id;
-    res.status(200).json({ message: "Profil berhasil diperbarui.", user: updatedUser });
+    res
+      .status(200)
+      .json({ message: "Profil berhasil diperbarui.", user: updatedUser });
   } catch (error) {
     res.status(500).json({ message: "Gagal memperbarui profil." });
   }
@@ -567,9 +729,15 @@ app.put("/api/profile", authUserMiddleware, async (req, res) => {
 // === ENDPOINTS UNTUK APLIKASI ADMIN ===
 app.get("/api/admin/settings", authAdminMiddleware, async (req, res) => {
   try {
-    const settings = await db.collection("settings").find().sort({ dayOfWeek: 1 }).toArray();
+    const settings = await db
+      .collection("settings")
+      .find()
+      .sort({ dayOfWeek: 1 })
+      .toArray();
     res.json(settings);
-  } catch (error) { res.status(500).json({ message: 'Error server.' }); }
+  } catch (error) {
+    res.status(500).json({ message: "Error server." });
+  }
 });
 
 app.put("/api/admin/settings", authAdminMiddleware, async (req, res) => {
@@ -577,17 +745,23 @@ app.put("/api/admin/settings", authAdminMiddleware, async (req, res) => {
     const updatedSettings = req.body;
     for (const setting of updatedSettings) {
       const { _id, ...dataToUpdate } = setting;
-      await db.collection("settings").updateOne({ _id: new ObjectId(_id) }, { $set: dataToUpdate });
+      await db
+        .collection("settings")
+        .updateOne({ _id: new ObjectId(_id) }, { $set: dataToUpdate });
     }
-    res.json({ message: 'Pengaturan berhasil diperbarui.' });
-  } catch (error) { res.status(500).json({ message: 'Gagal memperbarui pengaturan.' }); }
+    res.json({ message: "Pengaturan berhasil diperbarui." });
+  } catch (error) {
+    res.status(500).json({ message: "Gagal memperbarui pengaturan." });
+  }
 });
 
 app.get("/api/admin/events", authAdminMiddleware, async (req, res) => {
   try {
     const events = await db.collection("events").find().toArray();
     res.json(events);
-  } catch (error) { res.status(500).json({ message: 'Error server.' }); }
+  } catch (error) {
+    res.status(500).json({ message: "Error server." });
+  }
 });
 
 app.post("/api/admin/events", authAdminMiddleware, async (req, res) => {
@@ -596,33 +770,43 @@ app.post("/api/admin/events", authAdminMiddleware, async (req, res) => {
     eventData.date = new Date(eventData.date + "T00:00:00.000Z");
     await db.collection("events").deleteOne({ date: eventData.date });
     await db.collection("events").insertOne(eventData);
-    res.status(201).json({ message: 'Event berhasil dibuat.' });
-  } catch (error) { res.status(500).json({ message: 'Gagal membuat event.' }); }
+    res.status(201).json({ message: "Event berhasil dibuat." });
+  } catch (error) {
+    res.status(500).json({ message: "Gagal membuat event." });
+  }
 });
 
 app.get("/api/admin/memberships", authAdminMiddleware, async (req, res) => {
   try {
     const members = await db.collection("memberships").find().toArray();
     res.json(members);
-  } catch (error) { res.status(500).json({ message: 'Error server.' }); }
+  } catch (error) {
+    res.status(500).json({ message: "Error server." });
+  }
 });
 
 app.post("/api/admin/memberships", authAdminMiddleware, async (req, res) => {
   try {
     const memberData = req.body;
     await db.collection("memberships").insertOne(memberData);
-    res.status(201).json({ message: 'Member berhasil ditambahkan.' });
-  } catch (error) { res.status(500).json({ message: 'Gagal menambah member.' }); }
+    res.status(201).json({ message: "Member berhasil ditambahkan." });
+  } catch (error) {
+    res.status(500).json({ message: "Gagal menambah member." });
+  }
 });
 
 app.put("/api/admin/memberships/:id", authAdminMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
     const { recurringDay, recurringHour, courtName } = req.body;
-    await db.collection("memberships").updateOne(
+    await db
+      .collection("memberships")
+      .updateOne(
         { _id: new ObjectId(id) },
         { $set: { recurringDay, recurringHour, courtName } }
-    );
-    res.json({ message: 'Jadwal member berhasil dipindahkan.' });
-  } catch (error) { res.status(500).json({ message: 'Gagal memindahkan jadwal member.' }); }
+      );
+    res.json({ message: "Jadwal member berhasil dipindahkan." });
+  } catch (error) {
+    res.status(500).json({ message: "Gagal memindahkan jadwal member." });
+  }
 });
