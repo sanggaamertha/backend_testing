@@ -823,3 +823,33 @@ app.post("/api/admin/events", authAdminMiddleware, async (req, res) => {
     res.status(500).json({ message: "Gagal membuat event." });
   }
 });
+
+app.get("/api/admin/orders", authAdminMiddleware, async (req, res) => {
+  try {
+    const orders = await db.collection("orders").aggregate([
+      // Urutkan dari yang terbaru
+      { $sort: { createdAt: -1 } },
+      // Gabungkan dengan data user untuk mendapatkan nama pemesan
+      {
+        $lookup: {
+          from: "users",
+          localField: "userId",
+          foreignField: "_id",
+          as: "userDetails"
+        }
+      },
+      // Rapikan data user yang digabung
+      {
+        $unwind: {
+          path: "$userDetails",
+          preserveNullAndEmptyArrays: true // Tampilkan order meski user sudah dihapus
+        }
+      }
+    ]).toArray();
+    
+    res.json(orders);
+  } catch (error) {
+    console.error("Gagal mengambil semua order:", error);
+    res.status(500).json({ message: "Gagal mengambil riwayat pesanan." });
+  }
+});
