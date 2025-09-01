@@ -1,4 +1,4 @@
-// server.js (Versi Perbaikan Final dengan Firebase Admin SDK)
+// server.js (Versi Perbaikan Final dengan Dukungan Multi-Lapangan)
 
 const express = require("express");
 const http = require("http");
@@ -10,16 +10,15 @@ const jwt = require("jsonwebtoken");
 const validator = require("validator");
 const midtransClient = require("midtrans-client");
 const { format } = require("date-fns");
-const admin = require("firebase-admin"); // <-- TAMBAHAN BARU
+const admin = require("firebase-admin");
 
 require("dotenv").config();
 
-// --- [BARU] Inisialisasi Firebase Admin SDK ---
+// --- Inisialisasi Firebase Admin SDK ---
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
-// ---------------------------------------------
 
 const app = express();
 const server = http.createServer(app);
@@ -84,7 +83,8 @@ MongoClient.connect(mongoUri)
   .then(async (client) => {
     console.log("✅ Berhasil terhubung ke MongoDB Atlas");
     db = client.db(dbName);
-    await initializeDefaultSettings();
+    // Inisialisasi data default yang baru
+    await initializeDefaultData();
     setInterval(cleanupExpiredOrders, 60 * 1000);
     console.log("⏰ Robot pembersih pesanan kedaluwarsa telah aktif.");
 
@@ -104,9 +104,8 @@ io.on("connection", (socket) => {
   });
 });
 
-// === ENDPOINTS AUTENTIKASI (YANG DIPERBAIKI) ===
-
-// Endpoint BARU untuk login/register via Google
+// === ENDPOINTS AUTENTIKASI (TIDAK BERUBAH) ===
+// ... (Endpoint /api/auth/google-signin, /register, /login tetap sama)
 app.post("/api/auth/google-signin", async (req, res) => {
   const { idToken } = req.body;
   if (!idToken) {
@@ -114,36 +113,27 @@ app.post("/api/auth/google-signin", async (req, res) => {
   }
 
   try {
-    // 1. Verifikasi ID Token menggunakan Firebase Admin SDK
     const decodedToken = await admin.auth().verifyIdToken(idToken);
     const { uid, email, name } = decodedToken;
-
-    // 2. Cari user di database kita, atau buat baru jika belum ada
     let user = await db.collection("users").findOne({ email });
 
     if (!user) {
-      // User belum ada, daftarkan
       const newUser = {
         name: name || "Pengguna Google",
         email,
         phone: decodedToken.phone_number || "",
-        firebaseUid: uid, // Simpan UID Firebase untuk referensi
+        firebaseUid: uid,
         isAdmin: false,
         createdAt: new Date(),
-        // Tidak ada password untuk pengguna Google
       };
       const result = await db.collection("users").insertOne(newUser);
       user = { ...newUser, _id: result.insertedId };
     }
-
-    // 3. Buat JWT token kustom dari server kita
     const customToken = jwt.sign(
       { userId: user._id, email: user.email, isAdmin: user.isAdmin || false },
       JWT_SECRET,
       { expiresIn: "1d" }
     );
-
-    // 4. Kirim token kustom dan data user kembali ke client
     res.json({
       token: customToken,
       user: {
@@ -162,7 +152,6 @@ app.post("/api/auth/google-signin", async (req, res) => {
   }
 });
 
-// Endpoint register email biasa (tidak berubah)
 app.post("/api/auth/register", async (req, res) => {
   try {
     const { name, email, password, phone } = req.body;
@@ -188,7 +177,6 @@ app.post("/api/auth/register", async (req, res) => {
   }
 });
 
-// Endpoint login email biasa (DIPERBAIKI untuk handle pengguna Google)
 app.post("/api/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -196,7 +184,6 @@ app.post("/api/auth/login", async (req, res) => {
     if (!user)
       return res.status(401).json({ message: "Email atau password salah." });
 
-    // Tambahkan pengecekan jika user mendaftar via Google (tidak punya password)
     if (!user.password) {
       return res
         .status(401)
@@ -230,43 +217,64 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-// === FUNGSI HELPER & INISIALISASI ===
-async function initializeDefaultSettings() {
+
+// === [BARU] FUNGSI HELPER & INISIALISASI ===
+async function initializeDefaultData() {
+  const courtsCollection = db.collection("courts");
   const settingsCollection = db.collection("settings");
-  const count = await settingsCollection.countDocuments();
-  if (count === 0) {
-    console.log("🌱 Inisialisasi pengaturan jadwal default...");
-    const defaultSettings = [];
-    const days = [
-      "Minggu",
-      "Senin",
-      "Selasa",
-      "Rabu",
-      "Kamis",
-      "Jumat",
-      "Sabtu",
+  const courtsCount = await courtsCollection.countDocuments();
+
+  // Hanya jalankan jika koleksi courts kosong
+  if (courtsCount === 0) {
+    console.log("🌱 Inisialisasi data lapangan dan jadwal default...");
+
+    // 1. Buat beberapa lapangan default
+    const defaultCourts = [
+      { name: "Lapangan A", description: "Lantai Vinyl", createdAt: new Date() },
+      { name: "Lapangan B", description: "Lantai Sintetis", createdAt: new Date() },
+      { name: "Lapangan C", description: "Lantai 2 (Ekonomi)", createdAt: new Date() },
     ];
-    for (let i = 0; i < 7; i++) {
-      defaultSettings.push({
-        dayOfWeek: i,
-        dayName: days[i],
-        isActive: true,
-        openingHour: 8,
-        closingHour: 22,
-        basePrice: 20000,
-        priceOverrides: [{ fromHour: 18, toHour: 22, price: 35000 }],
-      });
+    const insertedCourts = await courtsCollection.insertMany(defaultCourts);
+    console.log(`✅ ${insertedCourts.insertedCount} lapangan default berhasil dibuat.`);
+
+    // 2. Buat jadwal default untuk SETIAP lapangan yang baru dibuat
+    const days = ["Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"];
+    let settingsToInsert = [];
+
+    for (const courtId of Object.values(insertedCourts.insertedIds)) {
+        const court = await courtsCollection.findOne({_id: courtId});
+        // Tentukan harga dasar berdasarkan nama lapangan untuk contoh
+        let basePrice = 25000;
+        if (court.name.includes("B")) basePrice = 30000;
+        if (court.name.includes("C")) basePrice = 20000;
+
+      for (let i = 0; i < 7; i++) {
+        settingsToInsert.push({
+          courtId: courtId, // Tautkan ke lapangan
+          dayOfWeek: i,
+          dayName: days[i],
+          isActive: true,
+          openingHour: 8,
+          closingHour: 23,
+          basePrice: basePrice,
+          priceOverrides: [{ fromHour: 18, toHour: 23, price: basePrice + 15000 }],
+        });
+      }
     }
-    await settingsCollection.insertMany(defaultSettings);
-    console.log("✅ Pengaturan default berhasil dibuat.");
+    await settingsCollection.insertMany(settingsToInsert);
+    console.log("✅ Pengaturan jadwal default untuk semua lapangan berhasil dibuat.");
   }
 }
 
 async function calculatePrice(playtime) {
   const targetDate = new Date(playtime.date);
   const dayOfWeek = targetDate.getUTCDay();
-  const setting = await db.collection("settings").findOne({ dayOfWeek });
-  if (!setting) throw new Error("Pengaturan jadwal tidak ditemukan");
+  // Cari setting berdasarkan courtId dan dayOfWeek
+  const setting = await db.collection("settings").findOne({
+      courtId: new ObjectId(playtime.courtId),
+      dayOfWeek
+  });
+  if (!setting) throw new Error("Pengaturan jadwal tidak ditemukan untuk lapangan ini");
   let price = setting.basePrice;
   if (setting.priceOverrides) {
     for (const override of setting.priceOverrides) {
@@ -282,30 +290,23 @@ async function calculatePrice(playtime) {
   return price;
 }
 
-// --- [PENAMBAHAN] Fungsi untuk membersihkan pesanan yang kedaluwarsa ---
 async function cleanupExpiredOrders() {
-  try {
-    const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
-    const result = await db.collection("orders").updateMany(
-      {
-        orderStatus: "pending",
-        createdAt: { $lt: tenMinutesAgo },
-      },
-      {
-        $set: { orderStatus: "failed" },
-      }
-    );
-    if (result.modifiedCount > 0) {
-      console.log(
-        `🧹 Berhasil membersihkan ${result.modifiedCount} pesanan yang kedaluwarsa.`
-      );
+    try {
+        const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
+        const result = await db.collection("orders").updateMany(
+            { orderStatus: "pending", createdAt: { $lt: tenMinutesAgo } },
+            { $set: { orderStatus: "failed" } }
+        );
+        if (result.modifiedCount > 0) {
+            console.log(`🧹 Berhasil membersihkan ${result.modifiedCount} pesanan yang kedaluwarsa.`);
+        }
+    } catch (error) {
+        console.error("❌ Error saat membersihkan pesanan kedaluwarsa:", error);
     }
-  } catch (error) {
-    console.error("❌ Error saat membersihkan pesanan kedaluwarsa:", error);
-  }
 }
 
-// === ENDPOINTS UNTUK APLIKASI KLIEN ===
+
+// === [DIROMBAK] ENDPOINT UNTUK APLIKASI KLIEN ===
 
 app.get("/api/schedule", authUserMiddleware, async (req, res) => {
   const { date } = req.query; // date is 'yyyy-MM-dd'
@@ -316,90 +317,103 @@ app.get("/api/schedule", authUserMiddleware, async (req, res) => {
     const targetDate = new Date(date + "T00:00:00.000Z");
     const dayOfWeek = targetDate.getUTCDay();
 
-    const setting = await db
-      .collection("settings")
-      .findOne({ dayOfWeek: dayOfWeek });
-    if (!setting || !setting.isActive) {
-      return res
-        .status(200)
-        .json({ message: "Tutup pada hari ini.", courts: [] });
+    // 1. Ambil semua data lapangan
+    const allCourts = await db.collection("courts").find().sort({name: 1}).toArray();
+    if (allCourts.length === 0) {
+        return res.status(200).json({ message: "Tidak ada lapangan yang tersedia.", courts: [] });
     }
 
+    // 2. Cek event global
     let event = await db.collection("events").findOne({ date: targetDate });
-    let openingHour = event?.openingHour ?? setting.openingHour;
-    let closingHour = event?.closingHour ?? setting.closingHour;
-
     if (event && event.isClosed) {
-      return res
-        .status(200)
-        .json({ message: `Tutup: ${event.reason}`, courts: [] });
+      return res.status(200).json({ message: `Tutup: ${event.reason}`, courts: [] });
     }
 
+    // 3. Ambil semua booking yang relevan pada hari itu
     const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
-    const bookings = await db
-      .collection("orders")
-      .find({
+    const bookings = await db.collection("orders").find({
         "playtimes.date": targetDate,
         $or: [
           { orderStatus: "paid" },
           { orderStatus: "pending", createdAt: { $gte: tenMinutesAgo } },
         ],
-      })
-      .toArray();
+      }).toArray();
+    
+    // 4. Ambil semua booking member yang relevan
+    const memberBookings = await db.collection("memberships").find({ recurringDay: dayOfWeek }).toArray();
 
-    const memberBookings = await db
-      .collection("memberships")
-      .find({ recurringDay: dayOfWeek })
-      .toArray();
+    // 5. Proses setiap lapangan
+    let finalSchedule = [];
 
-    const bookedSlots = new Map();
-
-    bookings.forEach((order) => {
-      order.playtimes.forEach((pt) => {
-        const key = `${pt.courtName}-${pt.startHour}`;
-        bookedSlots.set(key, order.orderStatus === "paid" ? 0 : 2);
-      });
-    });
-
-    memberBookings.forEach((member) => {
-      const key = `${member.courtName}-${member.recurringHour}`;
-      bookedSlots.set(key, 0);
-    });
-
-    const courtNames = ["A", "B", "C"];
-    const finalSchedule = courtNames.map((name) => {
-      const playtimes = [];
-      for (let hour = openingHour; hour < closingHour; hour++) {
-        const key = `${name}-${hour}`;
-        const slotStatus = bookedSlots.get(key);
-
-        let status = slotStatus !== undefined ? slotStatus : 1;
-
-        let price = setting.basePrice;
-        if (setting.priceOverrides) {
-          for (const override of setting.priceOverrides) {
-            if (hour >= override.fromHour && hour < override.toHour) {
-              price = override.price;
-              break;
-            }
-          }
+    for(const court of allCourts) {
+        const courtSetting = await db.collection("settings").findOne({ courtId: court._id, dayOfWeek: dayOfWeek });
+        
+        if (!courtSetting || !courtSetting.isActive) {
+            // Jika lapangan ini tutup, lewati
+            continue;
         }
 
-        const playtimeId = `${name}-${date}-${hour}`;
+        let openingHour = event?.openingHour ?? courtSetting.openingHour;
+        let closingHour = event?.closingHour ?? courtSetting.closingHour;
 
-        playtimes.push({
-          _id: playtimeId,
-          start: `${hour.toString().padStart(2, "0")}:00`,
-          end: `${(hour + 1).toString().padStart(2, "0")}:00`,
-          status: status,
-          price: price,
-          date: targetDate,
-          startHour: hour,
-          courtName: name,
+        const bookedSlots = new Map();
+
+        // Filter booking untuk lapangan ini saja
+        bookings.forEach((order) => {
+            order.playtimes.forEach((pt) => {
+                if(pt.courtId.equals(court._id)) {
+                    const key = `${pt.courtName}-${pt.startHour}`;
+                    bookedSlots.set(key, order.orderStatus === "paid" ? 0 : 2);
+                }
+            });
         });
-      }
-      return { _id: new ObjectId(), name: name, playtimes: playtimes };
-    });
+
+        // Filter booking member untuk lapangan ini saja
+        memberBookings.forEach((member) => {
+             if(member.courtId.equals(court._id)) {
+                const key = `${member.courtName}-${member.recurringHour}`;
+                bookedSlots.set(key, 0);
+             }
+        });
+        
+        const playtimes = [];
+        for (let hour = openingHour; hour < closingHour; hour++) {
+            const key = `${court.name}-${hour}`;
+            const slotStatus = bookedSlots.get(key);
+            let status = slotStatus !== undefined ? slotStatus : 1;
+
+            let price = courtSetting.basePrice;
+            if (courtSetting.priceOverrides) {
+                for (const override of courtSetting.priceOverrides) {
+                    if (hour >= override.fromHour && hour < override.toHour) {
+                        price = override.price;
+                        break;
+                    }
+                }
+            }
+
+            const playtimeId = `${court._id}-${date}-${hour}`;
+
+            playtimes.push({
+                _id: playtimeId,
+                start: `${hour.toString().padStart(2, "0")}:00`,
+                end: `${(hour + 1).toString().padStart(2, "0")}:00`,
+                status: status,
+                price: price,
+                date: targetDate,
+                startHour: hour,
+                courtName: court.name,
+                courtId: court._id, // Sertakan courtId
+            });
+        }
+        finalSchedule.push({ 
+            _id: court._id, 
+            name: court.name, 
+            description: court.description,
+            playtimes: playtimes 
+        });
+    }
+
     res.status(200).json({ message: "Jadwal tersedia", courts: finalSchedule });
   } catch (error) {
     console.error("Error get schedule:", error);
@@ -408,161 +422,127 @@ app.get("/api/schedule", authUserMiddleware, async (req, res) => {
 });
 
 app.post("/api/orders", authUserMiddleware, async (req, res) => {
-  const { playtimes } = req.body;
-  const userId = new ObjectId(req.user.userId);
-  const userEmail = req.user.email;
+    // Pastikan `playtimes` memiliki `courtId`
+    const { playtimes } = req.body;
+    const userId = new ObjectId(req.user.userId);
+    const userEmail = req.user.email;
 
-  if (!playtimes || playtimes.length === 0) {
-    return res.status(400).json({ message: "Pilih minimal satu jadwal." });
-  }
-
-  try {
-    const now = new Date();
-    for (const pt of playtimes) {
-      const slotTime = new Date(
-        new Date(pt.date).setHours(pt.startHour, 0, 0, 0)
-      );
-      if (now > slotTime) {
-        return res.status(400).json({
-          message: `Waktu untuk slot ${pt.courtName} jam ${pt.startHour}:00 sudah lewat.`,
-        });
-      }
+    if (!playtimes || playtimes.length === 0) {
+        return res.status(400).json({ message: "Pilih minimal satu jadwal." });
     }
 
-    for (const pt of playtimes) {
-      const targetDate = new Date(pt.date);
-      const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
-      const existingOrder = await db.collection("orders").findOne({
-        playtimes: {
-          $elemMatch: {
-            courtName: pt.courtName,
-            date: targetDate,
-            startHour: pt.startHour,
-          },
-        },
-        $or: [
-          { orderStatus: "paid" },
-          { orderStatus: "pending", createdAt: { $gte: tenMinutesAgo } },
-        ],
-      });
+    try {
+        // ... (validasi waktu & ketersediaan slot tetap sama, tapi sekarang perlu cek `courtId`)
+        const now = new Date();
+        for (const pt of playtimes) {
+            const slotTime = new Date(new Date(pt.date).setHours(pt.startHour, 0, 0, 0));
+            if (now > slotTime) {
+                return res.status(400).json({ message: `Waktu untuk slot ${pt.courtName} jam ${pt.startHour}:00 sudah lewat.` });
+            }
+        }
+        for (const pt of playtimes) {
+            const targetDate = new Date(pt.date);
+            const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
+            const existingOrder = await db.collection("orders").findOne({
+                "playtimes": {
+                    $elemMatch: {
+                        courtId: new ObjectId(pt.courtId),
+                        date: targetDate,
+                        startHour: pt.startHour
+                    }
+                },
+                $or: [
+                    { orderStatus: "paid" },
+                    { orderStatus: "pending", createdAt: { $gte: tenMinutesAgo } }
+                ]
+            });
 
-      if (existingOrder) {
-        const message =
-          existingOrder.orderStatus === "paid"
-            ? `Jadwal ${pt.courtName} jam ${pt.startHour}:00 sudah tidak tersedia.`
-            : `Jadwal ${pt.courtName} jam ${pt.startHour}:00 sedang dalam proses booking oleh orang lain.`;
-        return res.status(409).json({ message });
-      }
+            if (existingOrder) {
+                const message = existingOrder.orderStatus === "paid" ? `Jadwal ${pt.courtName} jam ${pt.startHour}:00 sudah tidak tersedia.` : `Jadwal ${pt.courtName} jam ${pt.startHour}:00 sedang dalam proses booking oleh orang lain.`;
+                return res.status(409).json({ message });
+            }
+        }
+
+        let serverTotal = 0;
+        const validatedPlaytimes = [];
+        const item_details = [];
+        const bookingDate = format(new Date(playtimes[0].date), "yyyy-MM-dd");
+
+        for (const pt of playtimes) {
+            const price = await calculatePrice(pt);
+            serverTotal += price;
+            validatedPlaytimes.push({
+                courtId: new ObjectId(pt.courtId), // Simpan sebagai ObjectId
+                courtName: pt.courtName,
+                date: new Date(pt.date),
+                startHour: pt.startHour,
+                price: price,
+            });
+            const playtimeId = `${pt.courtId}-${bookingDate}-${pt.startHour}`;
+            item_details.push({
+                id: playtimeId,
+                price: price,
+                quantity: 1,
+                name: `Booking Lap. ${pt.courtName} jam ${pt.startHour}:00`,
+            });
+        }
+
+        const orderId = `BINTON-${new ObjectId()}`;
+        const newOrder = {
+            _id: orderId,
+            userId,
+            playtimes: validatedPlaytimes,
+            total: serverTotal,
+            orderStatus: "pending",
+            createdAt: new Date(),
+            transactionToken: null,
+        };
+        await db.collection("orders").insertOne(newOrder);
+        
+        const parameter = {
+            transaction_details: { order_id: orderId, gross_amount: serverTotal },
+            customer_details: { email: userEmail },
+            item_details: item_details,
+            expiry: { unit: "minute", duration: 10 },
+        };
+        const transaction = await snap.createTransaction(parameter);
+        const transactionToken = transaction.token;
+        await db.collection("orders").updateOne({ _id: orderId }, { $set: { transactionToken: transactionToken } });
+
+        const updatedSlots = playtimes.map((pt) => ({
+            slotId: `${pt.courtId}-${bookingDate}-${pt.startHour}`,
+            newStatus: 2, // pending
+        }));
+
+        req.app.get("socketio").emit("schedule_updated", { date: bookingDate, slots: updatedSlots });
+        console.log(`📢 Memancarkan 'schedule_updated' (pending) untuk tanggal: ${bookingDate}`);
+
+        res.status(201).json({ message: "Transaksi berhasil dibuat. Selesaikan pembayaran dalam 10 menit.", transactionToken, orderId: orderId });
+    } catch (error) {
+        console.error("Booking Error:", error);
+        res.status(500).json({ message: "Gagal memproses booking." });
     }
-
-    let serverTotal = 0;
-    const validatedPlaytimes = [];
-    const item_details = [];
-
-    const bookingDate = format(new Date(playtimes[0].date), "yyyy-MM-dd");
-
-    for (const pt of playtimes) {
-      const price = await calculatePrice(pt);
-      serverTotal += price;
-      validatedPlaytimes.push({
-        courtName: pt.courtName,
-        date: new Date(pt.date),
-        startHour: pt.startHour,
-        price: price,
-      });
-      const playtimeId = `${pt.courtName}-${bookingDate}-${pt.startHour}`;
-      item_details.push({
-        id: playtimeId,
-        price: price,
-        quantity: 1,
-        name: `Booking Lap. ${pt.courtName} jam ${pt.startHour}:00`,
-      });
-    }
-
-    const orderId = `BINTON-${new ObjectId()}`;
-    const newOrder = {
-      _id: orderId,
-      userId,
-      playtimes: validatedPlaytimes,
-      total: serverTotal,
-      orderStatus: "pending",
-      createdAt: new Date(),
-      transactionToken: null,
-    };
-    await db.collection("orders").insertOne(newOrder);
-
-    const parameter = {
-      transaction_details: { order_id: orderId, gross_amount: serverTotal },
-      customer_details: { email: userEmail },
-      item_details: item_details,
-      expiry: { unit: "minute", duration: 10 },
-    };
-    const transaction = await snap.createTransaction(parameter);
-    const transactionToken = transaction.token;
-    await db
-      .collection("orders")
-      .updateOne(
-        { _id: orderId },
-        { $set: { transactionToken: transactionToken } }
-      );
-
-    const updatedSlots = playtimes.map((pt) => {
-      return {
-        slotId: `${pt.courtName}-${bookingDate}-${pt.startHour}`,
-        newStatus: 2, // 2 = pending
-      };
-    });
-
-    const socketIo = req.app.get("socketio");
-    socketIo.emit("schedule_updated", {
-      date: bookingDate,
-      slots: updatedSlots,
-    });
-    console.log(
-      `📢 Memancarkan 'schedule_updated' (pending) untuk tanggal: ${bookingDate} dengan slot:`,
-      updatedSlots
-    );
-
-    res.status(201).json({
-      message:
-        "Transaksi berhasil dibuat. Selesaikan pembayaran dalam 10 menit.",
-      transactionToken,
-      orderId: orderId,
-    });
-  } catch (error) {
-    console.error("Booking Error:", error);
-    res.status(500).json({ message: "Gagal memproses booking." });
-  }
 });
 
+// Endpoint lain (/api/payment-notification, /my-orders, dll) tidak banyak berubah
+// Namun, pada `schedule_updated` emit, slotId sekarang harus menyertakan courtId.
 app.post("/api/payment-notification", async (req, res) => {
   const notificationJson = req.body;
   try {
-    const statusResponse = await snap.transaction.notification(
-      notificationJson
-    );
+    const statusResponse = await snap.transaction.notification(notificationJson);
     const orderId = statusResponse.order_id;
     const transactionStatus = statusResponse.transaction_status;
     const fraudStatus = statusResponse.fraud_status;
     const order = await db.collection("orders").findOne({ _id: orderId });
 
-    if (
-      !order ||
-      order.orderStatus === "paid" ||
-      order.orderStatus === "failed"
-    ) {
-      return res
-        .status(200)
-        .send("Notification ignored: Order not found or already processed.");
+    if (!order || order.orderStatus === "paid" || order.orderStatus === "failed") {
+      return res.status(200).send("Notification ignored: Order not found or already processed.");
     }
 
     let newStatus = order.orderStatus;
     let isSuccess = false;
 
-    if (
-      (transactionStatus == "capture" && fraudStatus == "accept") ||
-      transactionStatus == "settlement"
-    ) {
+    if ((transactionStatus == "capture" && fraudStatus == "accept") || transactionStatus == "settlement") {
       newStatus = "paid";
       isSuccess = true;
     } else if (["cancel", "deny", "expire"].includes(transactionStatus)) {
@@ -570,35 +550,20 @@ app.post("/api/payment-notification", async (req, res) => {
     }
 
     if (newStatus !== order.orderStatus) {
-      await db
-        .collection("orders")
-        .updateOne(
-          { _id: orderId },
-          { $set: { orderStatus: newStatus, paymentResponse: statusResponse } }
-        );
+      await db.collection("orders").updateOne({ _id: orderId }, { $set: { orderStatus: newStatus, paymentResponse: statusResponse } });
 
       if (order.playtimes && order.playtimes.length > 0) {
-        const bookingDate = format(
-          new Date(order.playtimes[0].date),
-          "yyyy-MM-dd"
-        );
+        const bookingDate = format(new Date(order.playtimes[0].date), "yyyy-MM-dd");
         const updatedSlots = order.playtimes.map((pt) => {
           const ptDate = format(new Date(pt.date), "yyyy-MM-dd");
           return {
-            slotId: `${pt.courtName}-${ptDate}-${pt.startHour}`,
+            slotId: `${pt.courtId}-${ptDate}-${pt.startHour}`, // Menggunakan courtId
             newStatus: isSuccess ? 0 : 1,
           };
         });
 
-        const socketIo = req.app.get("socketio");
-        socketIo.emit("schedule_updated", {
-          date: bookingDate,
-          slots: updatedSlots,
-        });
-        console.log(
-          `📢 Memancarkan 'schedule_updated' (notif) untuk tanggal: ${bookingDate} dengan status: ${newStatus}`,
-          updatedSlots
-        );
+        req.app.get("socketio").emit("schedule_updated", { date: bookingDate, slots: updatedSlots });
+        console.log(`📢 Memancarkan 'schedule_updated' (notif) untuk tanggal: ${bookingDate} dengan status: ${newStatus}`);
       }
     }
     res.status(200).send("Notification received successfully.");
@@ -607,11 +572,9 @@ app.post("/api/payment-notification", async (req, res) => {
     res.status(500).send("Internal Server Error");
   }
 });
+// ... sisa endpoint klien tetap sama
 
-app.get(
-  "/api/orders/:orderId/resume-payment",
-  authUserMiddleware,
-  async (req, res) => {
+app.get("/api/orders/:orderId/resume-payment", authUserMiddleware, async (req, res) => {
     try {
       const { orderId } = req.params;
       const userId = new ObjectId(req.user.userId);
@@ -623,37 +586,26 @@ app.get(
         return res.status(403).json({ message: "Akses ditolak." });
       }
       if (order.orderStatus !== "pending") {
-        return res
-          .status(400)
-          .json({ message: `Pesanan ini sudah ${order.orderStatus}.` });
+        return res.status(400).json({ message: `Pesanan ini sudah ${order.orderStatus}.` });
       }
       const now = new Date();
       const orderTime = new Date(order.createdAt);
       const diffInMinutes = (now - orderTime) / (1000 * 60);
       if (diffInMinutes > 10) {
-        await db
-          .collection("orders")
-          .updateOne({ _id: orderId }, { $set: { orderStatus: "failed" } });
-        return res
-          .status(410)
-          .json({ message: "Waktu pembayaran sudah habis." });
+        await db.collection("orders").updateOne({ _id: orderId }, { $set: { orderStatus: "failed" } });
+        return res.status(410).json({ message: "Waktu pembayaran sudah habis." });
       }
       res.status(200).json({ transactionToken: order.transactionToken });
     } catch (error) {
       console.error("Resume Payment Error:", error);
       res.status(500).json({ message: "Gagal melanjutkan pembayaran." });
     }
-  }
-);
+});
 
 app.get("/api/my-orders", authUserMiddleware, async (req, res) => {
   try {
     const userId = new ObjectId(req.user.userId);
-    const orders = await db
-      .collection("orders")
-      .find({ userId: userId })
-      .sort({ createdAt: -1 })
-      .toArray();
+    const orders = await db.collection("orders").find({ userId: userId }).sort({ createdAt: -1 }).toArray();
     res.status(200).json(orders);
   } catch (error) {
     res.status(500).json({ message: "Gagal mengambil data pesanan." });
@@ -664,37 +616,19 @@ app.delete("/api/orders/:orderId", authUserMiddleware, async (req, res) => {
   try {
     const { orderId } = req.params;
     const userId = new ObjectId(req.user.userId);
-
     const order = await db.collection("orders").findOne({ _id: orderId });
-
-    // Cek 1: Pesanan ada atau tidak
     if (!order) {
       return res.status(404).json({ message: "Pesanan tidak ditemukan." });
     }
-
-    // Cek 2: Apakah pesanan ini milik user yang sedang login
     if (!order.userId.equals(userId)) {
-      return res
-        .status(403)
-        .json({ message: "Anda tidak berhak menghapus pesanan ini." });
+      return res.status(403).json({ message: "Anda tidak berhak menghapus pesanan ini." });
     }
-
-    // Cek 3: Aturan 3 hari
     const threeDaysAgo = new Date();
     threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
-
     if (new Date(order.createdAt) > threeDaysAgo) {
-      return res
-        .status(400)
-        .json({
-          message:
-            "Pesanan yang baru (kurang dari 3 hari) tidak dapat dihapus.",
-        });
+      return res.status(400).json({ message: "Pesanan yang baru (kurang dari 3 hari) tidak dapat dihapus." });
     }
-
-    // Jika semua cek lolos, hapus pesanan
     await db.collection("orders").deleteOne({ _id: orderId });
-
     res.status(200).json({ message: "Riwayat pesanan berhasil dihapus." });
   } catch (error) {
     console.error("Delete Order Error:", error);
@@ -706,48 +640,122 @@ app.put("/api/profile", authUserMiddleware, async (req, res) => {
   try {
     const userId = new ObjectId(req.user.userId);
     const { name, phone } = req.body;
-    if (!name || !phone)
-      return res
-        .status(400)
-        .json({ message: "Nama dan nomor telepon tidak boleh kosong." });
-    await db
-      .collection("users")
-      .updateOne({ _id: userId }, { $set: { name: name, phone: phone } });
-    const updatedUser = await db
-      .collection("users")
-      .findOne({ _id: userId }, { projection: { password: 0 } });
+    if (!name || !phone) return res.status(400).json({ message: "Nama dan nomor telepon tidak boleh kosong." });
+    await db.collection("users").updateOne({ _id: userId }, { $set: { name: name, phone: phone } });
+    const updatedUser = await db.collection("users").findOne({ _id: userId }, { projection: { password: 0 } });
     updatedUser.id = updatedUser._id;
     delete updatedUser._id;
-    res
-      .status(200)
-      .json({ message: "Profil berhasil diperbarui.", user: updatedUser });
+    res.status(200).json({ message: "Profil berhasil diperbarui.", user: updatedUser });
   } catch (error) {
     res.status(500).json({ message: "Gagal memperbarui profil." });
   }
 });
 
-// === ENDPOINTS UNTUK APLIKASI ADMIN ===
-app.get("/api/admin/settings", authAdminMiddleware, async (req, res) => {
+
+// === [DIROMBAK] ENDPOINTS UNTUK APLIKASI ADMIN ===
+
+// --- [BARU] CRUD untuk Courts ---
+app.get("/api/admin/courts", authAdminMiddleware, async (req, res) => {
   try {
-    const settings = await db
-      .collection("settings")
-      .find()
+    const courts = await db.collection("courts").find().sort({name: 1}).toArray();
+    res.json(courts);
+  } catch (error) {
+    res.status(500).json({ message: "Gagal mengambil data lapangan." });
+  }
+});
+
+app.post("/api/admin/courts", authAdminMiddleware, async (req, res) => {
+    try {
+        const { name, description } = req.body;
+        if (!name) return res.status(400).json({ message: "Nama lapangan wajib diisi." });
+
+        const newCourtData = { name, description, createdAt: new Date() };
+        const result = await db.collection("courts").insertOne(newCourtData);
+        const newCourtId = result.insertedId;
+
+        // Saat lapangan baru dibuat, generate juga pengaturan default 7 hari untuknya
+        const days = ["Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"];
+        let settingsToInsert = [];
+        for (let i = 0; i < 7; i++) {
+            settingsToInsert.push({
+                courtId: newCourtId,
+                dayOfWeek: i,
+                dayName: days[i],
+                isActive: true,
+                openingHour: 8,
+                closingHour: 23,
+                basePrice: 25000, // Harga default awal
+                priceOverrides: [],
+            });
+        }
+        await db.collection("settings").insertMany(settingsToInsert);
+        
+        res.status(201).json({ message: "Lapangan dan jadwal default berhasil dibuat.", newCourt: {...newCourtData, _id: newCourtId} });
+    } catch (error) {
+        res.status(500).json({ message: "Gagal membuat lapangan." });
+    }
+});
+
+app.put("/api/admin/courts/:id", authAdminMiddleware, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { name, description } = req.body;
+        if (!name) return res.status(400).json({ message: "Nama lapangan wajib diisi." });
+
+        await db.collection("courts").updateOne(
+            { _id: new ObjectId(id) },
+            { $set: { name, description } }
+        );
+        res.json({ message: "Data lapangan berhasil diperbarui." });
+    } catch (error) {
+        res.status(500).json({ message: "Gagal memperbarui lapangan." });
+    }
+});
+
+app.delete("/api/admin/courts/:id", authAdminMiddleware, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const courtId = new ObjectId(id);
+
+        // Hapus lapangan dan juga semua jadwal terkait
+        await db.collection("courts").deleteOne({ _id: courtId });
+        await db.collection("settings").deleteMany({ courtId: courtId });
+        
+        // Opsional: Handle member yang terdaftar di lapangan ini
+        // Untuk saat ini kita biarkan, tapi di aplikasi production perlu ditangani
+
+        res.json({ message: "Lapangan dan jadwal terkait berhasil dihapus." });
+    } catch (error) {
+        res.status(500).json({ message: "Gagal menghapus lapangan." });
+    }
+});
+
+
+// --- Pengaturan Jadwal (Settings) disesuaikan ---
+app.get("/api/admin/settings/:courtId", authAdminMiddleware, async (req, res) => {
+  try {
+    const { courtId } = req.params;
+    const settings = await db.collection("settings")
+      .find({ courtId: new ObjectId(courtId) })
       .sort({ dayOfWeek: 1 })
       .toArray();
     res.json(settings);
   } catch (error) {
-    res.status(500).json({ message: "Error server." });
+    res.status(500).json({ message: "Error mengambil pengaturan." });
   }
 });
 
 app.put("/api/admin/settings", authAdminMiddleware, async (req, res) => {
   try {
-    const updatedSettings = req.body;
+    const updatedSettings = req.body; // Ini adalah array 7 jadwal untuk 1 lapangan
     for (const setting of updatedSettings) {
       const { _id, ...dataToUpdate } = setting;
-      await db
-        .collection("settings")
-        .updateOne({ _id: new ObjectId(_id) }, { $set: dataToUpdate });
+      // Hapus courtId dari data yang diupdate agar tidak menimpa
+      delete dataToUpdate.courtId; 
+      await db.collection("settings").updateOne(
+          { _id: new ObjectId(_id) },
+          { $set: dataToUpdate }
+        );
     }
     res.json({ message: "Pengaturan berhasil diperbarui." });
   } catch (error) {
@@ -755,6 +763,46 @@ app.put("/api/admin/settings", authAdminMiddleware, async (req, res) => {
   }
 });
 
+
+// --- Endpoint lain disesuaikan untuk menyertakan `courtId` ---
+app.get("/api/admin/memberships", authAdminMiddleware, async (req, res) => {
+  try {
+    const members = await db.collection("memberships").find().toArray();
+    res.json(members);
+  } catch (error) {
+    res.status(500).json({ message: "Error server." });
+  }
+});
+
+app.post("/api/admin/memberships", authAdminMiddleware, async (req, res) => {
+  try {
+    const { courtId, ...memberData } = req.body;
+    await db.collection("memberships").insertOne({
+        ...memberData,
+        courtId: new ObjectId(courtId) // Simpan sebagai ObjectId
+    });
+    res.status(201).json({ message: "Member berhasil ditambahkan." });
+  } catch (error) {
+    res.status(500).json({ message: "Gagal menambah member." });
+  }
+});
+
+app.put("/api/admin/memberships/:id", authAdminMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { courtId, ...dataToUpdate } = req.body;
+    await db.collection("memberships").updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { ...dataToUpdate, courtId: new ObjectId(courtId) } }
+      );
+    res.json({ message: "Jadwal member berhasil diperbarui." });
+  } catch (error) {
+    res.status(500).json({ message: "Gagal memperbarui jadwal member." });
+  }
+});
+
+
+// --- Endpoint Events tidak berubah (bersifat global) ---
 app.get("/api/admin/events", authAdminMiddleware, async (req, res) => {
   try {
     const events = await db.collection("events").find().toArray();
@@ -773,40 +821,5 @@ app.post("/api/admin/events", authAdminMiddleware, async (req, res) => {
     res.status(201).json({ message: "Event berhasil dibuat." });
   } catch (error) {
     res.status(500).json({ message: "Gagal membuat event." });
-  }
-});
-
-app.get("/api/admin/memberships", authAdminMiddleware, async (req, res) => {
-  try {
-    const members = await db.collection("memberships").find().toArray();
-    res.json(members);
-  } catch (error) {
-    res.status(500).json({ message: "Error server." });
-  }
-});
-
-app.post("/api/admin/memberships", authAdminMiddleware, async (req, res) => {
-  try {
-    const memberData = req.body;
-    await db.collection("memberships").insertOne(memberData);
-    res.status(201).json({ message: "Member berhasil ditambahkan." });
-  } catch (error) {
-    res.status(500).json({ message: "Gagal menambah member." });
-  }
-});
-
-app.put("/api/admin/memberships/:id", authAdminMiddleware, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { recurringDay, recurringHour, courtName } = req.body;
-    await db
-      .collection("memberships")
-      .updateOne(
-        { _id: new ObjectId(id) },
-        { $set: { recurringDay, recurringHour, courtName } }
-      );
-    res.json({ message: "Jadwal member berhasil dipindahkan." });
-  } catch (error) {
-    res.status(500).json({ message: "Gagal memindahkan jadwal member." });
   }
 });
